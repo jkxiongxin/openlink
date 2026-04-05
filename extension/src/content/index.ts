@@ -60,17 +60,400 @@ interface SiteConfig {
   responseSelector?: string;
 }
 
+interface SiteAdapter {
+  id: string;
+  matches(): boolean;
+  config: SiteConfig;
+  getConversationId(): string;
+  getSourceKey(sourceEl?: Element): string;
+  isAssistantResponse(el: Element | null): boolean;
+  shouldRenderToolText(text: string, sourceEl?: Element): boolean;
+  getToolCardMount(sourceEl: Element): { anchor: Element; before: Element | null } | null;
+  getEditorRegion(editor: Element | null): Element | null;
+  getSendButton(editor: HTMLElement, sendBtnSel: string): HTMLElement | null;
+  fillValue?(editor: HTMLElement, text: string, editorSel: string, sendBtnSel: string): Promise<boolean>;
+}
+
+function defaultConversationId(): string {
+  const m = location.pathname.match(/\/a\/chat\/s\/([^/?#]+)/) || location.pathname.match(/\/chat\/([^/?#]+)/) || location.search.match(/[?&]id=([^&]+)/);
+  return m ? m[1] : '__default__';
+}
+
+function getElementPathKey(el: Element | null, depth = 6): string {
+  if (!el) return 'none';
+  const parts: string[] = [];
+  let cursor: Element | null = el;
+  while (cursor && parts.length < depth) {
+    let index = 0;
+    let prev = cursor.previousElementSibling;
+    while (prev) { index++; prev = prev.previousElementSibling; }
+    parts.push(`${cursor.tagName.toLowerCase()}:${index}`);
+    cursor = cursor.parentElement;
+  }
+  return parts.join('>');
+}
+
+function defaultSourceKey(sourceEl?: Element): string {
+  if (!sourceEl) return 'global';
+  const item = sourceEl.closest('[data-virtual-list-item-key]');
+  if (item) return item.getAttribute('data-virtual-list-item-key') || 'item';
+  const message = sourceEl.closest('.ds-message, message-content, ms-chat-turn, .prose');
+  if (message) return `${getElementPathKey(message)}:${hashStr((message.textContent || '').slice(0, 200))}`;
+  return `${getElementPathKey(sourceEl)}:${hashStr((sourceEl.textContent || '').slice(0, 120))}`;
+}
+
+function defaultToolMount(sourceEl: Element): { anchor: Element; before: Element | null } | null {
+  const messageContent = sourceEl.closest('message-content') ?? sourceEl.closest('.prose') ?? sourceEl;
+  const anchor = messageContent.parentElement ?? sourceEl.parentElement;
+  if (!anchor) return null;
+  return { anchor, before: messageContent };
+}
+
+function defaultEditorRegion(editor: Element | null): Element | null {
+  if (!editor) return null;
+  return editor.closest('form') ?? editor.parentElement?.parentElement ?? editor.parentElement ?? null;
+}
+
+function arenaActionRow(root: Element): Element | null {
+  return Array.from(root.children).find((child) => {
+    if (!(child instanceof Element)) return false;
+    const hasLike = !!child.querySelector('button[aria-label="Like this response"]');
+    const hasDislike = !!child.querySelector('button[aria-label="Dislike this response"]');
+    return hasLike && hasDislike;
+  }) as Element | null;
+}
+
+const siteAdapters: SiteAdapter[] = [
+  {
+    id: 'arena',
+    matches: () => location.hostname === 'arena.ai' && (location.pathname.startsWith('/text/direct') || location.pathname.startsWith('/c/')),
+    config: {
+      editor: 'textarea[name="message"][placeholder*="Ask followup"], textarea[name="message"], form textarea, textarea',
+      sendBtn: 'form button[type="submit"]:not([disabled]), form button[type="submit"]',
+      stopBtn: null,
+      fillMethod: 'value',
+      useObserver: true,
+      responseSelector: '.prose',
+    },
+    getConversationId: defaultConversationId,
+    getSourceKey(sourceEl) {
+      if (!sourceEl) return 'global';
+      let cursor: Element | null = sourceEl.closest('.prose') ?? sourceEl;
+      while (cursor) {
+        const row = arenaActionRow(cursor);
+        if (row) return `${getElementPathKey(cursor)}:${hashStr((cursor.textContent || '').slice(0, 300))}`;
+        cursor = cursor.parentElement;
+      }
+      return defaultSourceKey(sourceEl);
+    },
+    isAssistantResponse(el) {
+      if (!el) return false;
+      let cursor: Element | null = el.closest('.prose') ?? el;
+      while (cursor) {
+        const row = arenaActionRow(cursor);
+        if (row) return true;
+        cursor = cursor.parentElement;
+      }
+      return false;
+    },
+    shouldRenderToolText(text, sourceEl) {
+      if (sourceEl?.closest('pre, code')) return false;
+      const normalized = text.replace(/\s+/g, ' ').trim();
+      if (!normalized.startsWith('<tool')) return false;
+      return true;
+    },
+    getToolCardMount(sourceEl) {
+      const prose = sourceEl.closest('.prose') ?? sourceEl;
+      let cursor: Element | null = prose;
+      while (cursor) {
+        const row = arenaActionRow(cursor);
+        if (row) return { anchor: cursor, before: row };
+        cursor = cursor.parentElement;
+      }
+      const messageCard = prose.closest('.bg-surface-primary.relative.flex.w-full.min-w-0.flex-1.flex-col') as Element | null;
+      if (messageCard) return { anchor: messageCard, before: messageCard.lastElementChild ?? null };
+      const proseWrapper = prose.parentElement?.parentElement ?? prose.parentElement;
+      if (!proseWrapper) return null;
+      return { anchor: proseWrapper, before: proseWrapper.firstElementChild ?? null };
+    },
+    getEditorRegion: defaultEditorRegion,
+    getSendButton(editor, sendBtnSel) {
+      const form = editor.closest('form');
+      if (form) {
+        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
+          const btn = form.querySelector(sel) as HTMLElement | null;
+          if (btn && isVisibleElement(btn)) return btn;
+        }
+      }
+      return querySelectorFirst(sendBtnSel);
+    },
+    async fillValue(editor, text, editorSel, sendBtnSel) {
+      const ta = await fillArenaTextarea(text, editorSel, sendBtnSel);
+      return !!ta;
+    },
+  },
+  {
+    id: 'deepseek',
+    matches: () => location.hostname === 'chat.deepseek.com',
+    config: {
+      editor: 'textarea[placeholder*="DeepSeek"], textarea',
+      sendBtn: 'div.bf38813a div[role="button"][aria-disabled], div[role="button"][aria-disabled]',
+      stopBtn: null,
+      fillMethod: 'value',
+      useObserver: true,
+      responseSelector: '.ds-message .ds-markdown',
+    },
+    getConversationId: defaultConversationId,
+    getSourceKey: defaultSourceKey,
+    isAssistantResponse(el) {
+      if (!el) return false;
+      const item = el.closest('[data-virtual-list-item-key]');
+      if (!item) return false;
+      if (!item.querySelector('.ds-message .ds-markdown')) return false;
+      if (item.querySelector('textarea')) return false;
+      return true;
+    },
+    shouldRenderToolText: () => true,
+    getToolCardMount(sourceEl) {
+      const message = sourceEl.closest('[data-virtual-list-item-key]') ?? sourceEl.closest('.ds-message')?.parentElement;
+      if (!message) return null;
+      const actionRow = Array.from(message.children).find((child) => {
+        if (!(child instanceof Element)) return false;
+        return !!child.querySelector('div[role="button"][aria-disabled]');
+      }) as Element | undefined;
+      return { anchor: message, before: actionRow ?? null };
+    },
+    getEditorRegion: defaultEditorRegion,
+    getSendButton(editor) {
+      const region = defaultEditorRegion(editor);
+      if (!region) return null;
+      const buttons = Array.from(region.querySelectorAll<HTMLElement>('div[role="button"][aria-disabled]')).filter((btn) => isVisibleElement(btn));
+      return buttons.at(-1) ?? null;
+    },
+  },
+  {
+    id: 'labsfx',
+    matches: () => location.hostname === 'labs.google' && location.pathname.startsWith('/fx'),
+    config: {
+      editor: 'div[role="textbox"][data-slate-editor="true"][contenteditable="true"]',
+      sendBtn: 'button',
+      stopBtn: null,
+      fillMethod: 'execCommand',
+      useObserver: false,
+    },
+    getConversationId: defaultConversationId,
+    getSourceKey: defaultSourceKey,
+    isAssistantResponse: () => false,
+    shouldRenderToolText: () => false,
+    getToolCardMount: defaultToolMount,
+    getEditorRegion(editor) {
+      if (!editor) return null;
+      return editor.closest('.sc-84e494b2-0') ?? defaultEditorRegion(editor);
+    },
+    getSendButton(editor) {
+      const region = (editor.closest('.sc-84e494b2-0') ?? defaultEditorRegion(editor)) as Element | null;
+      if (!region) return null;
+      const buttons = Array.from(region.querySelectorAll<HTMLElement>('button')).filter((btn) => isVisibleElement(btn));
+      const action = buttons.findLast((btn) => {
+        const iconText = btn.querySelector('.google-symbols')?.textContent?.trim();
+        return iconText === 'arrow_forward' || (btn.textContent || '').includes('创建');
+      });
+      return action ?? buttons.at(-1) ?? null;
+    },
+  },
+  {
+    id: 'doubao',
+    matches: () => location.hostname === 'www.doubao.com' || location.hostname === 'doubao.com',
+    config: {
+      editor: 'textarea[data-testid="chat_input_input"], textarea.semi-input-textarea',
+      sendBtn: 'button[data-testid="chat_input_send_button"], #flow-end-msg-send',
+      stopBtn: null,
+      fillMethod: 'value',
+      useObserver: true,
+      responseSelector: '[data-testid="receive_message"] [data-testid="message_text_content"], [data-testid="receive_message"] [data-testid="message_content"]',
+    },
+    getConversationId: defaultConversationId,
+    getSourceKey(sourceEl) {
+      if (!sourceEl) return 'global';
+      const msg = sourceEl.closest('[data-testid="message_content"]');
+      const id = msg?.getAttribute('data-message-id');
+      if (id) return id;
+      return defaultSourceKey(sourceEl);
+    },
+    isAssistantResponse(el) {
+      if (!el) return false;
+      const receive = el.closest('[data-testid="receive_message"]');
+      if (!receive) return false;
+      return !!receive.querySelector('[data-testid="message_action_bar"]');
+    },
+    shouldRenderToolText(text, sourceEl) {
+      if (sourceEl?.closest('pre, code')) return false;
+      return text.replace(/\s+/g, ' ').includes('<tool');
+    },
+    getToolCardMount(sourceEl) {
+      const receive = sourceEl.closest('[data-testid="receive_message"]');
+      if (!receive) return null;
+      const content = receive.querySelector('[data-testid="message_content"]') as Element | null;
+      const column = content?.parentElement as Element | null;
+      const actionBar = receive.querySelector('[data-testid="message_action_bar"]') as Element | null;
+      if (column) return { anchor: column, before: actionBar?.parentElement ?? actionBar ?? null };
+      if (content) return { anchor: content, before: content.lastElementChild };
+      return { anchor: receive, before: actionBar };
+    },
+    getEditorRegion(editor) {
+      if (!editor) return null;
+      return editor.closest('.relative.flex.flex-col-reverse') ?? editor.closest('[data-testid="input-container"]') ?? defaultEditorRegion(editor);
+    },
+    getSendButton(editor, sendBtnSel) {
+      const region = (editor.closest('.relative.flex.flex-col-reverse') ?? defaultEditorRegion(editor)) as Element | null;
+      if (region) {
+        const btn = region.querySelector<HTMLElement>('button[data-testid="chat_input_send_button"], #flow-end-msg-send');
+        if (btn && isVisibleElement(btn)) return btn;
+      }
+      return querySelectorFirst(sendBtnSel);
+    },
+  },
+  {
+    id: 'qwen',
+    matches: () => location.hostname === 'tongyi.aliyun.com' || location.hostname === 'chat.qwen.ai',
+    config: {
+      editor: 'textarea.message-input-textarea, .message-input-container textarea',
+      sendBtn: '.message-input-right-button-send button.send-button, button.send-button',
+      stopBtn: null,
+      fillMethod: 'value',
+      useObserver: true,
+      responseSelector: '.chat-response-message .response-message-content .qwen-markdown, .chat-response-message .response-message-content',
+    },
+    getConversationId: defaultConversationId,
+    getSourceKey(sourceEl) {
+      if (!sourceEl) return 'global';
+      const msg = sourceEl.closest('.chat-response-message');
+      if (msg?.id) return msg.id;
+      return defaultSourceKey(sourceEl);
+    },
+    isAssistantResponse(el) {
+      if (!el) return false;
+      const msg = el.closest('.chat-response-message');
+      if (!msg) return false;
+      if (msg.querySelector('.response-message-content')) return true;
+      return false;
+    },
+    shouldRenderToolText(text, sourceEl) {
+      if (sourceEl?.closest('pre, code')) return false;
+      return text.replace(/\s+/g, ' ').includes('<tool');
+    },
+    getToolCardMount(sourceEl) {
+      const message = sourceEl.closest('.chat-response-message');
+      if (!message) return null;
+      const body = message.querySelector('.chat-response-message-right > div') as Element | null;
+      if (!body) return { anchor: message, before: message.firstElementChild };
+      const footer = body.querySelector('.message-hoc-container');
+      return { anchor: body, before: footer ?? body.lastElementChild };
+    },
+    getEditorRegion(editor) {
+      if (!editor) return null;
+      return editor.closest('.message-input-container') ?? defaultEditorRegion(editor);
+    },
+    getSendButton(editor, sendBtnSel) {
+      const region = (editor.closest('.message-input-container') ?? defaultEditorRegion(editor)) as Element | null;
+      if (region) {
+        const btn = region.querySelector<HTMLElement>('.message-input-right-button-send button.send-button, button.send-button');
+        if (btn && isVisibleElement(btn)) return btn;
+      }
+      return querySelectorFirst(sendBtnSel);
+    },
+  },
+  {
+    id: 'gemini',
+    matches: () => location.hostname.includes('gemini.google.com'),
+    config: {
+      editor: 'div.ql-editor[contenteditable="true"]',
+      sendBtn: 'button.send-button[aria-label*="发送"], button.send-button[aria-label*="Send"]',
+      stopBtn: null,
+      fillMethod: 'execCommand',
+      useObserver: true,
+      responseSelector: 'model-response, .model-response-text, message-content',
+    },
+    getConversationId: defaultConversationId,
+    getSourceKey: defaultSourceKey,
+    isAssistantResponse: () => true,
+    shouldRenderToolText: () => true,
+    getToolCardMount: defaultToolMount,
+    getEditorRegion: defaultEditorRegion,
+    getSendButton(editor, sendBtnSel) {
+      const form = editor.closest('form');
+      if (form) {
+        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
+          const btn = form.querySelector(sel) as HTMLElement | null;
+          if (btn && isVisibleElement(btn)) return btn;
+        }
+      }
+      return querySelectorFirst(sendBtnSel);
+    },
+  },
+  {
+    id: 'default',
+    matches: () => true,
+    config: {
+      editor: 'textarea[placeholder*="Start typing a prompt"]',
+      sendBtn: 'button.ctrl-enter-submits.ms-button-primary[type="submit"], button[aria-label*="Run"]',
+      stopBtn: null,
+      fillMethod: 'value',
+      useObserver: true,
+      responseSelector: 'ms-chat-turn',
+    },
+    getConversationId: defaultConversationId,
+    getSourceKey: defaultSourceKey,
+    isAssistantResponse: () => true,
+    shouldRenderToolText: () => true,
+    getToolCardMount: defaultToolMount,
+    getEditorRegion: defaultEditorRegion,
+    getSendButton(editor, sendBtnSel) {
+      const form = editor.closest('form');
+      if (form) {
+        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
+          const btn = form.querySelector(sel) as HTMLElement | null;
+          if (btn && isVisibleElement(btn)) return btn;
+        }
+      }
+      return querySelectorFirst(sendBtnSel);
+    },
+  },
+];
+
+function getSiteAdapter(): SiteAdapter {
+  return siteAdapters.find((adapter) => adapter.matches())!;
+}
+
 function getSiteConfig(): SiteConfig {
-  const h = location.hostname;
-  const p = location.pathname;
-  if (h.includes('gemini.google.com'))
-    return { editor: 'div.ql-editor[contenteditable="true"]', sendBtn: 'button.send-button[aria-label*="发送"], button.send-button[aria-label*="Send"]', stopBtn: null, fillMethod: 'execCommand', useObserver: true, responseSelector: 'model-response, .model-response-text, message-content' };
-  if (h === 'arena.ai' && (p.startsWith('/text/direct') || p.startsWith('/c/')))
-    return { editor: 'textarea[name="message"][placeholder*="Ask followup"], textarea[name="message"], form textarea, textarea', sendBtn: 'form button[type="submit"]:not([disabled]), form button[type="submit"]', stopBtn: null, fillMethod: 'value', useObserver: true, responseSelector: '.prose' };
-  if (h === 'chat.deepseek.com')
-    return { editor: 'textarea[placeholder*="DeepSeek"], textarea', sendBtn: 'div.bf38813a div[role="button"][aria-disabled], div[role="button"][aria-disabled]', stopBtn: null, fillMethod: 'value', useObserver: true, responseSelector: '.ds-message .ds-markdown' };
-  // Default: AI Studio
-  return { editor: 'textarea[placeholder*="Start typing a prompt"]', sendBtn: 'button.ctrl-enter-submits.ms-button-primary[type="submit"], button[aria-label*="Run"]', stopBtn: null, fillMethod: 'value', useObserver: true, responseSelector: 'ms-chat-turn' };
+  return getSiteAdapter().config;
+}
+
+const DEBUG_LOG_LIMIT = 200;
+let debugModeEnabled = false;
+let debugLogSeq = 0;
+let debugPanelLogEl: HTMLPreElement | null = null;
+const debugLogs: string[] = [];
+
+function formatDebugValue(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
+function refreshDebugLogView() {
+  if (!debugPanelLogEl) return;
+  debugPanelLogEl.textContent = debugLogs.join('\n');
+  debugPanelLogEl.scrollTop = debugPanelLogEl.scrollHeight;
+}
+
+function debugLog(message: string, data?: unknown) {
+  const suffix = formatDebugValue(data);
+  const line = `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })} #${++debugLogSeq}] ${message}${suffix ? ` ${suffix}` : ''}`;
+  console.log('[OpenLink][Debug]', message, data ?? '');
+  debugLogs.push(line);
+  if (debugLogs.length > DEBUG_LOG_LIMIT) debugLogs.splice(0, debugLogs.length - DEBUG_LOG_LIMIT);
+  if (debugModeEnabled) refreshDebugLogView();
 }
 
 if (!(window as any).__OPENLINK_LOADED__) {
@@ -78,6 +461,7 @@ if (!(window as any).__OPENLINK_LOADED__) {
 
   const cfg = getSiteConfig();
   let debugMode = false;
+  debugLog('内容脚本已加载', { adapter: getSiteAdapter().id, href: location.href });
 
   if (!cfg.useObserver) {
     const script = document.createElement('script');
@@ -98,17 +482,22 @@ if (!(window as any).__OPENLINK_LOADED__) {
 
   const mountDebugUi = () => {
     injectInitButton();
+    debugModeEnabled = debugMode;
     if (debugMode) injectDebugPanel();
     else removeDebugPanel();
   };
 
   chrome.storage.local.get(['debugMode']).then((result) => {
     debugMode = !!result.debugMode;
+    debugModeEnabled = debugMode;
+    debugLog('调试模式状态初始化', { enabled: debugMode });
     if (document.body) mountDebugUi();
   });
   chrome.storage.onChanged.addListener((changes) => {
     if ('debugMode' in changes) {
       debugMode = !!changes.debugMode.newValue;
+      debugModeEnabled = debugMode;
+      debugLog('调试模式状态变更', { enabled: debugMode });
       if (document.body) mountDebugUi();
     }
   });
@@ -117,6 +506,11 @@ if (!(window as any).__OPENLINK_LOADED__) {
 
   if (document.body) mountInputListener();
   else document.addEventListener('DOMContentLoaded', mountInputListener);
+
+  if (location.hostname === 'labs.google' && location.pathname.startsWith('/fx')) {
+    if (document.body) startLabsFxImageWorker();
+    else document.addEventListener('DOMContentLoaded', startLabsFxImageWorker);
+  }
 }
 
 function hashStr(s: string): number {
@@ -125,19 +519,9 @@ function hashStr(s: string): number {
   return h >>> 0;
 }
 
-function getConversationId(): string {
-  const m = location.pathname.match(/\/a\/chat\/s\/([^/?#]+)/) || location.pathname.match(/\/chat\/([^/?#]+)/) || location.search.match(/[?&]id=([^&]+)/);
-  return m ? m[1] : '__default__';
-}
+function getConversationId(): string { return getSiteAdapter().getConversationId(); }
 
-function getSourceKey(sourceEl?: Element): string {
-  if (!sourceEl) return 'global';
-  const item = sourceEl.closest('[data-virtual-list-item-key]');
-  if (item) return (item.getAttribute('data-virtual-list-item-key') || 'item');
-  const message = sourceEl.closest('.ds-message, message-content, ms-chat-turn, .prose');
-  if (message) return `${message.tagName.toLowerCase()}:${hashStr((message.textContent || '').slice(0, 200))}`;
-  return `${sourceEl.tagName.toLowerCase()}:${hashStr((sourceEl.textContent || '').slice(0, 120))}`;
-}
+function getSourceKey(sourceEl?: Element): string { return getSiteAdapter().getSourceKey(sourceEl); }
 
 function isExecuted(key: string): boolean {
   try {
@@ -173,73 +557,15 @@ async function executeToolCallRaw(toolCall: any): Promise<string> {
 }
 
 function getToolCardMount(sourceEl: Element): { anchor: Element; before: Element | null } | null {
-  if (location.hostname === 'arena.ai' && (location.pathname.startsWith('/text/direct') || location.pathname.startsWith('/c/'))) {
-    const prose = sourceEl.closest('.prose') ?? sourceEl;
-    const findActionRow = (root: Element): Element | null => {
-      return Array.from(root.children).find((child) => {
-        if (!(child instanceof Element)) return false;
-        return !!child.querySelector('button[aria-label="Like this response"], button[aria-label="Dislike this response"]');
-      }) as Element | null;
-    };
-
-    let cursor: Element | null = prose;
-    while (cursor) {
-      const actionRow = findActionRow(cursor);
-      if (actionRow) return { anchor: cursor, before: actionRow };
-      cursor = cursor.parentElement;
-    }
-
-    const proseWrapper = prose.parentElement?.parentElement ?? prose.parentElement;
-    if (proseWrapper) {
-      return { anchor: proseWrapper, before: proseWrapper.firstElementChild ?? null };
-    }
-  }
-
-  if (location.hostname === 'chat.deepseek.com') {
-    const message = sourceEl.closest('[data-virtual-list-item-key]') ?? sourceEl.closest('.ds-message')?.parentElement;
-    if (message) {
-      const actionRow = Array.from(message.children).find((child) => {
-        if (!(child instanceof Element)) return false;
-        return !!child.querySelector('div[role="button"][aria-disabled]');
-      }) as Element | undefined;
-      return { anchor: message, before: actionRow ?? null };
-    }
-  }
-
-  const messageContent = sourceEl.closest('message-content') ?? sourceEl.closest('.prose') ?? sourceEl;
-  const anchor = messageContent.parentElement ?? sourceEl.parentElement;
-  if (!anchor) return null;
-  return { anchor, before: messageContent };
+  return getSiteAdapter().getToolCardMount(sourceEl);
 }
 
-function isArenaAssistantResponse(el: Element | null): boolean {
-  if (!el || location.hostname !== 'arena.ai' || !(location.pathname.startsWith('/text/direct') || location.pathname.startsWith('/c/'))) return true;
-  let cursor: Element | null = el.closest('.prose') ?? el;
-  while (cursor) {
-    const hasActionRow = Array.from(cursor.children).some((child) => {
-      if (!(child instanceof Element)) return false;
-      return !!child.querySelector('button[aria-label="Like this response"], button[aria-label="Dislike this response"]');
-    });
-    if (hasActionRow) return true;
-    cursor = cursor.parentElement;
-  }
-  return false;
+function isAssistantResponse(el: Element | null): boolean {
+  return getSiteAdapter().isAssistantResponse(el);
 }
 
-function shouldRenderArenaToolText(text: string, sourceEl?: Element): boolean {
-  if (location.hostname !== 'arena.ai' || !(location.pathname.startsWith('/text/direct') || location.pathname.startsWith('/c/'))) return true;
-  if (sourceEl?.closest('pre, code')) return false;
-  const toolOnly = text.replace(/<tool(?:\s[^>]*)?>[\s\S]*?<\/tool>/g, ' ').replace(/\s+/g, ' ').trim();
-  return toolOnly.length <= 24;
-}
-
-function isDeepSeekAssistantResponse(el: Element | null): boolean {
-  if (!el || location.hostname !== 'chat.deepseek.com') return true;
-  const item = el.closest('[data-virtual-list-item-key]');
-  if (!item) return false;
-  if (!item.querySelector('.ds-message .ds-markdown')) return false;
-  if (item.querySelector('textarea')) return false;
-  return true;
+function shouldRenderToolText(text: string, sourceEl?: Element): boolean {
+  return getSiteAdapter().shouldRenderToolText(text, sourceEl);
 }
 
 function renderToolCard(data: any, _full: string, sourceEl: Element, key: string, processed: Set<string>) {
@@ -327,9 +653,8 @@ function startDOMObserver(responseSelector: string) {
 
   function scanText(text: string, sourceEl?: Element) {
     if (!text.includes('<tool')) return;
-    if (sourceEl && !isArenaAssistantResponse(sourceEl)) return;
-    if (sourceEl && !isDeepSeekAssistantResponse(sourceEl)) return;
-    if (!shouldRenderArenaToolText(text, sourceEl)) return;
+    if (sourceEl && !isAssistantResponse(sourceEl)) return;
+    if (!shouldRenderToolText(text, sourceEl)) return;
     TOOL_RE.lastIndex = 0;
     let match;
     while ((match = TOOL_RE.exec(text)) !== null) {
@@ -377,7 +702,7 @@ function startDOMObserver(responseSelector: string) {
     while (el) {
       if (responseSelectors.some(sel => {
         try { return el!.matches(sel); } catch { return false; }
-      }) && isArenaAssistantResponse(el) && isDeepSeekAssistantResponse(el)) return el;
+      }) && isAssistantResponse(el)) return el;
       el = el.parentElement;
     }
     return null;
@@ -458,8 +783,7 @@ function startDOMObserver(responseSelector: string) {
   // Initial scan for already-rendered tool calls (e.g. after page refresh)
   requestAnimationFrame(() => {
     document.querySelectorAll(responseSelector).forEach(el => {
-      if (!isArenaAssistantResponse(el)) return;
-      if (!isDeepSeekAssistantResponse(el)) return;
+      if (!isAssistantResponse(el)) return;
       scanText(getCleanText(el), el);
     });
   });
@@ -482,6 +806,7 @@ function injectInitButton() {
 
 function removeDebugPanel() {
   document.getElementById('openlink-debug-panel')?.remove();
+  debugPanelLogEl = null;
 }
 
 function shortenHtml(html: string, max = 4000): string {
@@ -509,10 +834,7 @@ function elementSnapshot(el: Element | null) {
   };
 }
 
-function getEditorRegion(editor: Element | null): Element | null {
-  if (!editor) return null;
-  return editor.closest('form') ?? editor.parentElement?.parentElement ?? editor.parentElement ?? null;
-}
+function getEditorRegion(editor: Element | null): Element | null { return getSiteAdapter().getEditorRegion(editor); }
 
 function getNearbyButtons(editor: Element | null): Element[] {
   const region = getEditorRegion(editor);
@@ -534,6 +856,7 @@ function collectDebugData() {
   return {
     capturedAt: new Date().toISOString(),
     location: { href: location.href, hostname: location.hostname, pathname: location.pathname },
+    adapterId: getSiteAdapter().id,
     siteConfig: cfg,
     activeElement: elementSnapshot(document.activeElement as Element | null),
     currentEditor: elementSnapshot(currentEditor),
@@ -546,6 +869,7 @@ function collectDebugData() {
     nearbyButtons: getNearbyButtons(currentEditor).map((el) => elementSnapshot(el)),
     latestResponses: responseNodes.map((el) => elementSnapshot(el)),
     latestToolContainers: toolNodes.map((el) => elementSnapshot(el)),
+    debugLogs: [...debugLogs],
   };
 }
 
@@ -569,7 +893,7 @@ function injectDebugPanel() {
   if (document.getElementById('openlink-debug-panel')) return;
   const panel = document.createElement('div');
   panel.id = 'openlink-debug-panel';
-  panel.style.cssText = 'position:fixed;bottom:180px;right:20px;z-index:99999;width:220px;background:#111827;color:#f3f4f6;border:1px solid #374151;border-radius:12px;padding:10px;box-shadow:0 8px 24px rgba(0,0,0,0.35);font-size:12px';
+  panel.style.cssText = 'position:fixed;bottom:180px;right:20px;z-index:99999;width:320px;max-height:70vh;background:#111827;color:#f3f4f6;border:1px solid #374151;border-radius:12px;padding:10px;box-shadow:0 8px 24px rgba(0,0,0,0.35);font-size:12px;display:flex;flex-direction:column';
 
   const title = document.createElement('div');
   title.textContent = 'OpenLink 调试模式';
@@ -610,6 +934,18 @@ function injectDebugPanel() {
         void copyText(last?.outerHTML || '');
       },
     },
+    {
+      label: '复制调试日志',
+      onClick: () => copyText(debugLogs.join('\n')),
+    },
+    {
+      label: '清空调试日志',
+      onClick: () => {
+        debugLogs.length = 0;
+        refreshDebugLogView();
+        showToast('已清空调试日志', 2000);
+      },
+    },
   ];
 
   for (const action of actions) {
@@ -626,11 +962,378 @@ function injectDebugPanel() {
   hint.style.cssText = 'margin-top:8px;color:#9ca3af;line-height:1.4';
   panel.appendChild(hint);
 
+  const logTitle = document.createElement('div');
+  logTitle.textContent = '实时日志';
+  logTitle.style.cssText = 'margin-top:8px;margin-bottom:6px;font-weight:700';
+  panel.appendChild(logTitle);
+
+  const logBox = document.createElement('pre');
+  logBox.style.cssText = 'margin:0;flex:1;min-height:180px;max-height:260px;overflow:auto;background:#030712;border:1px solid #374151;border-radius:8px;padding:8px;color:#d1fae5;font-size:11px;line-height:1.45;white-space:pre-wrap;word-break:break-word';
+  panel.appendChild(logBox);
+  debugPanelLogEl = logBox;
+  refreshDebugLogView();
+
   document.body.appendChild(panel);
+  debugLog('调试面板已挂载');
 }
 
 async function bgFetch(url: string, options?: any): Promise<{ ok: boolean; status: number; body: string }> {
   return chrome.runtime.sendMessage({ type: 'FETCH', url, options });
+}
+
+async function bgFetchBinary(url: string, options?: any): Promise<{ ok: boolean; status: number; bodyBase64: string; contentType: string; finalUrl: string; error?: string }> {
+  return chrome.runtime.sendMessage({ type: 'FETCH_BINARY', url, options });
+}
+
+let labsFxWorkerStarted = false;
+
+function startLabsFxImageWorker() {
+  if (labsFxWorkerStarted) return;
+  labsFxWorkerStarted = true;
+  debugLog('labs.google/fx worker 已启动');
+  let running = false;
+
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const { authToken, apiUrl } = await chrome.storage.local.get(['authToken', 'apiUrl']);
+      if (!authToken || !apiUrl) {
+        debugLog('labsfx 跳过轮询，缺少配置', { hasAuthToken: !!authToken, hasApiUrl: !!apiUrl });
+        return;
+      }
+      const headers: Record<string, string> = { Authorization: `Bearer ${authToken}` };
+      const resp = await bgFetch(`${apiUrl}/bridge/image-jobs/next`, { headers });
+      if (!resp.ok) {
+        debugLog('labsfx 拉取任务失败', { status: resp.status });
+        return;
+      }
+      const payload = JSON.parse(resp.body || '{}');
+      const job = payload.job;
+      if (!job?.id || !job?.prompt) return;
+      debugLog('labsfx 收到图片任务', { id: job.id, prompt: String(job.prompt).slice(0, 120) });
+      try {
+        await runLabsFxImageJob(job, apiUrl, authToken);
+      } catch (err) {
+        debugLog('labsfx 任务执行失败，准备回传错误', { id: job.id, error: err instanceof Error ? err.message : String(err) });
+        await bgFetch(`${apiUrl}/bridge/image-jobs/${encodeURIComponent(job.id)}/result`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+        });
+        throw err;
+      }
+    } catch (err) {
+      console.warn('[OpenLink] labs.google/fx image worker error:', err);
+      debugLog('labsfx worker 异常', err instanceof Error ? err.message : String(err));
+    } finally {
+      running = false;
+    }
+  };
+
+  void tick();
+  window.setInterval(() => { void tick(); }, 2500);
+}
+
+async function runLabsFxImageJob(job: any, apiUrl: string, authToken: string) {
+  showToast(`开始生成图片: ${job.id}`, 2500);
+  debugLog('labsfx 开始执行任务', { id: job.id });
+  const editor = await waitForElement<HTMLElement>('div[role="textbox"][data-slate-editor="true"][contenteditable="true"]', 20000);
+  debugLog('labsfx 已定位输入框');
+  const beforeKeys = getLabsFxTileKeys();
+  debugLog('labsfx 生成前图片 key 集合', beforeKeys);
+  await setLabsFxPrompt(editor, String(job.prompt));
+  debugLog('labsfx Prompt 已写入', { prompt: String(job.prompt).slice(0, 120), editorText: getEditorText(editor).slice(0, 120) });
+  await sleep(300);
+  const sendBtn = getSendButtonForEditor(editor, getSiteConfig().sendBtn);
+  if (!sendBtn) throw new Error('labs.google/fx send button not found');
+  debugLog('labsfx 已定位发送按钮', { text: (sendBtn.textContent || '').trim().slice(0, 60) });
+  await clickElementLikeUser(sendBtn);
+  debugLog('labsfx 已触发发送按钮点击');
+
+  const imageEl = await waitForNewLabsFxImage(beforeKeys, 180000);
+  const src = imageEl.getAttribute('src');
+  if (!src) throw new Error('generated image src missing');
+  debugLog('labsfx 检测到新图片', { src });
+
+  const absoluteUrl = new URL(src, location.href).toString();
+  const imageResp = await bgFetchBinary(absoluteUrl, { credentials: 'include' });
+  if (!imageResp.ok || !imageResp.bodyBase64) throw new Error(`image fetch failed: HTTP ${imageResp.status}${imageResp.error ? ` ${imageResp.error}` : ''}`);
+  debugLog('labsfx 图片抓取成功', { status: imageResp.status, url: absoluteUrl, finalUrl: imageResp.finalUrl, contentType: imageResp.contentType });
+  const base64 = imageResp.bodyBase64;
+  const fileName = `${job.id}${guessImageExtension(imageResp.contentType || '', imageResp.finalUrl || absoluteUrl)}`;
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${authToken}`,
+    'Content-Type': 'application/json',
+  };
+  const resultResp = await bgFetch(`${apiUrl}/bridge/image-jobs/${encodeURIComponent(job.id)}/result`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      file_name: fileName,
+      mime_type: imageResp.contentType || 'image/png',
+      data: base64,
+    }),
+  });
+  if (!resultResp.ok) throw new Error(`image result upload failed: HTTP ${resultResp.status}`);
+  debugLog('labsfx 图片结果回传成功', { fileName, status: resultResp.status });
+  showToast(`图片已保存: ${fileName}`, 3500);
+}
+
+async function clickElementLikeUser(el: HTMLElement) {
+  el.focus();
+  const rect = el.getBoundingClientRect();
+  const clientX = rect.left + Math.max(1, Math.min(rect.width - 1, rect.width / 2 || 1));
+  const clientY = rect.top + Math.max(1, Math.min(rect.height - 1, rect.height / 2 || 1));
+  const mouseInit = { bubbles: true, cancelable: true, composed: true, clientX, clientY, button: 0 };
+
+  try { el.dispatchEvent(new PointerEvent('pointerdown', mouseInit)); } catch {}
+  el.dispatchEvent(new MouseEvent('mousedown', mouseInit));
+  await sleep(30);
+  try { el.dispatchEvent(new PointerEvent('pointerup', mouseInit)); } catch {}
+  el.dispatchEvent(new MouseEvent('mouseup', mouseInit));
+  el.dispatchEvent(new MouseEvent('click', mouseInit));
+  await sleep(80);
+
+  if (location.hostname === 'labs.google' && location.pathname.startsWith('/fx')) {
+    const stillThere = document.contains(el);
+    if (stillThere) {
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+    }
+  }
+}
+
+function setContentEditableText(el: HTMLElement, text: string) {
+  el.focus();
+  const selection = window.getSelection();
+  if (selection) {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  document.execCommand('insertText', false, text);
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+async function setLabsFxPrompt(editor: HTMLElement, text: string) {
+  debugLog('labsfx 开始写入 Prompt', { text: text.slice(0, 120) });
+  const clearBtn = Array.from(editor.parentElement?.parentElement?.querySelectorAll('button') || []).find((btn) => {
+    return (btn.textContent || '').includes('清除提示');
+  }) as HTMLElement | undefined;
+  if (clearBtn && isVisibleElement(clearBtn)) {
+    debugLog('labsfx 点击清除提示');
+    await clickElementLikeUser(clearBtn);
+    await sleep(120);
+  }
+
+  clearLabsFxEditor(editor);
+  debugLog('labsfx 已清空输入框');
+  await sleep(100);
+
+  pasteIntoLabsFxEditor(editor, text);
+  await sleep(150);
+  debugLog('labsfx paste 后校验', {
+    plain: getEditorText(editor).replace(/\uFEFF/g, '').trim().slice(0, 120),
+    hasStringNode: !!editor.querySelector('[data-slate-string="true"]'),
+  });
+
+  if (!isLabsFxPromptApplied(editor, text)) {
+    clearLabsFxEditor(editor);
+    await sleep(80);
+    placeCaretInLabsFxEditor(editor);
+    document.execCommand('insertText', false, text);
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+    editor.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(150);
+    debugLog('labsfx insertText 后校验', {
+      plain: getEditorText(editor).replace(/\uFEFF/g, '').trim().slice(0, 120),
+      hasStringNode: !!editor.querySelector('[data-slate-string="true"]'),
+    });
+  }
+
+  if (!isLabsFxPromptApplied(editor, text)) {
+    clearLabsFxEditor(editor);
+    await sleep(80);
+    placeCaretInLabsFxEditor(editor);
+    setContentEditableText(editor, text);
+    await sleep(150);
+    debugLog('labsfx contenteditable 回退后校验', {
+      plain: getEditorText(editor).replace(/\uFEFF/g, '').trim().slice(0, 120),
+      hasStringNode: !!editor.querySelector('[data-slate-string="true"]'),
+    });
+  }
+
+  if (!isLabsFxPromptApplied(editor, text)) {
+    debugLog('labsfx Prompt 写入失败', shortenHtml(editor.innerHTML || '', 1000));
+    throw new Error('labs.google/fx editor fill failed');
+  }
+  debugLog('labsfx Prompt 写入成功');
+}
+
+function clearLabsFxEditor(editor: HTMLElement) {
+  editor.focus();
+  const selection = window.getSelection();
+  if (selection) {
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  document.execCommand('delete', false);
+  editor.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null }));
+  editor.dispatchEvent(new Event('input', { bubbles: true }));
+  editor.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function pasteIntoLabsFxEditor(editor: HTMLElement, text: string) {
+  placeCaretInLabsFxEditor(editor);
+  const dataTransfer = new DataTransfer();
+  dataTransfer.setData('text/plain', text);
+  editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dataTransfer, bubbles: true, cancelable: true }));
+  editor.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertFromPaste', data: text }));
+}
+
+function isLabsFxPromptApplied(editor: HTMLElement, text: string): boolean {
+  const plain = getEditorText(editor).replace(/\uFEFF/g, '').trim();
+  const hasStringNode = Array.from(editor.querySelectorAll('[data-slate-string="true"]')).some((node) => (node.textContent || '').includes(text));
+  return plain === text.trim() && hasStringNode;
+}
+
+function placeCaretInLabsFxEditor(editor: HTMLElement) {
+  editor.focus();
+  const selection = window.getSelection();
+  if (!selection) return;
+
+  const stringNode = editor.querySelector('[data-slate-string="true"]')?.firstChild;
+  if (stringNode) {
+    const range = document.createRange();
+    range.setStart(stringNode, stringNode.textContent?.length ?? 0);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return;
+  }
+
+  const zeroWidthNode = editor.querySelector('[data-slate-zero-width]')?.firstChild;
+  if (zeroWidthNode) {
+    const offset = Math.min(1, zeroWidthNode.textContent?.length ?? 0);
+    const range = document.createRange();
+    range.setStart(zeroWidthNode, offset);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return;
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(editor);
+  range.collapse(false);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function getLatestLabsFxImageKey(): string {
+  const tile = getLatestLabsFxTile();
+  if (!tile) return '';
+  return tile.getAttribute('data-tile-id') || tile.querySelector('img[alt="生成的图片"]')?.getAttribute('src') || '';
+}
+
+function getLatestLabsFxImage(): HTMLImageElement | null {
+  return getLatestLabsFxTile()?.querySelector('img[alt="生成的图片"]') ?? null;
+}
+
+function getLatestLabsFxTile(): HTMLElement | null {
+  const tiles = Array.from(document.querySelectorAll<HTMLElement>('[data-tile-id]')).filter((tile) => {
+    if (!isVisibleElement(tile)) return false;
+    return !!tile.querySelector('img[alt="生成的图片"]');
+  });
+  return tiles[0] ?? tiles.at(-1) ?? null;
+}
+
+function getLabsFxTileKeys(): string[] {
+  return Array.from(document.querySelectorAll<HTMLElement>('[data-tile-id]'))
+    .filter((tile) => isVisibleElement(tile) && !!tile.querySelector('img[alt="生成的图片"]'))
+    .map((tile) => tile.getAttribute('data-tile-id') || tile.querySelector('img[alt="生成的图片"]')?.getAttribute('src') || '')
+    .filter(Boolean);
+}
+
+function getLabsFxNewTile(previousKeys: Set<string>): { tile: HTMLElement; key: string; img: HTMLImageElement } | null {
+  const tiles = Array.from(document.querySelectorAll<HTMLElement>('[data-tile-id]')).filter((tile) => {
+    if (!isVisibleElement(tile)) return false;
+    return !!tile.querySelector('img[alt="生成的图片"]');
+  });
+  for (const tile of tiles) {
+    const img = tile.querySelector('img[alt="生成的图片"]') as HTMLImageElement | null;
+    if (!img) continue;
+    const key = tile.getAttribute('data-tile-id') || img.getAttribute('src') || '';
+    if (!key || previousKeys.has(key)) continue;
+    return { tile, key, img };
+  }
+  return null;
+}
+
+async function waitForNewLabsFxImage(previousKeysInput: string[] | Set<string>, timeoutMs: number): Promise<HTMLImageElement> {
+  const deadline = Date.now() + timeoutMs;
+  const previousKeys = previousKeysInput instanceof Set ? previousKeysInput : new Set(previousKeysInput);
+  debugLog('labsfx 等待新图片', { previousKeys: Array.from(previousKeys), timeoutMs });
+  let lastSeenKeys = '';
+  while (Date.now() < deadline) {
+    const currentKeys = getLabsFxTileKeys();
+    const currentKeySummary = currentKeys.join(',');
+    if (currentKeySummary !== lastSeenKeys) {
+      lastSeenKeys = currentKeySummary;
+      debugLog('labsfx 当前资源列表 key', currentKeys);
+    }
+    const found = getLabsFxNewTile(previousKeys);
+    if (found && found.img.complete && found.img.naturalWidth > 0) {
+      debugLog('labsfx 新图片已就绪', { key: found.key, width: found.img.naturalWidth, height: found.img.naturalHeight });
+      return found.img;
+    }
+    await sleep(1000);
+  }
+  debugLog('labsfx 等待新图片超时', { previousKeys: Array.from(previousKeys), timeoutMs, currentKeys: getLabsFxTileKeys() });
+  throw new Error('wait for generated image timed out');
+}
+
+async function waitForElement<T extends Element>(selector: string, timeoutMs: number): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const el = document.querySelector(selector) as T | null;
+    if (el) return el;
+    await sleep(250);
+  }
+  throw new Error(`element not found: ${selector}`);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function blobToBase64(blob: Blob): Promise<string> {
+  const buffer = await blob.arrayBuffer();
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function guessImageExtension(mimeType: string, src: string): string {
+  const lowerMime = mimeType.toLowerCase();
+  if (lowerMime.includes('png')) return '.png';
+  if (lowerMime.includes('jpeg') || lowerMime.includes('jpg')) return '.jpg';
+  if (lowerMime.includes('webp')) return '.webp';
+  const match = src.match(/\.(png|jpe?g|webp|gif)(?:$|\?)/i);
+  return match ? `.${match[1].toLowerCase() === 'jpeg' ? 'jpg' : match[1].toLowerCase()}` : '.png';
 }
 
 async function sendInitPrompt() {
@@ -834,24 +1537,7 @@ function getCurrentEditor(editorSel: string): HTMLElement | null {
 }
 
 function getSendButtonForEditor(editor: HTMLElement, sendBtnSel: string): HTMLElement | null {
-  if (location.hostname === 'chat.deepseek.com') {
-    const region = getEditorRegion(editor);
-    if (region) {
-      const buttons = Array.from(region.querySelectorAll<HTMLElement>('div[role="button"][aria-disabled]'));
-      const enabled = buttons.find((btn) => btn.getAttribute('aria-disabled') === 'false' && isVisibleElement(btn));
-      if (enabled) return enabled;
-      const fallback = buttons.find((btn) => isVisibleElement(btn));
-      if (fallback) return fallback;
-    }
-  }
-  const form = editor.closest('form');
-  if (form) {
-    for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
-      const btn = form.querySelector(sel) as HTMLElement | null;
-      if (btn && isVisibleElement(btn)) return btn;
-    }
-  }
-  return querySelectorFirst(sendBtnSel);
+  return getSiteAdapter().getSendButton(editor, sendBtnSel);
 }
 
 function applyTextareaValue(ta: HTMLTextAreaElement, next: string): void {
@@ -901,7 +1587,8 @@ async function fillArenaTextarea(result: string, editorSel: string, sendBtnSel: 
 }
 
 async function fillAndSend(result: string, autoSend = false) {
-  const { editor: editorSel, sendBtn: sendBtnSel, fillMethod } = getSiteConfig();
+  const adapter = getSiteAdapter();
+  const { editor: editorSel, sendBtn: sendBtnSel, fillMethod } = adapter.config;
   const editor = getCurrentEditor(editorSel);
   if (!editor) {
     const visibleTextareas = getVisibleTextareas().length;
@@ -910,6 +1597,7 @@ async function fillAndSend(result: string, autoSend = false) {
   }
 
   editor.focus();
+  debugLog('开始填充输入框', { adapter: adapter.id, fillMethod, autoSend, resultPreview: result.slice(0, 120) });
 
   if (fillMethod === 'paste') {
     const dataTransfer = new DataTransfer();
@@ -918,9 +1606,9 @@ async function fillAndSend(result: string, autoSend = false) {
   } else if (fillMethod === 'execCommand') {
     document.execCommand('insertText', false, result);
   } else if (fillMethod === 'value') {
-    if (location.hostname === 'arena.ai' && (location.pathname.startsWith('/text/direct') || location.pathname.startsWith('/c/'))) {
-      const ta = await fillArenaTextarea(result, editorSel, sendBtnSel);
-      if (!ta) return;
+    if (adapter.fillValue) {
+      const ok = await adapter.fillValue(editor, result, editorSel, sendBtnSel);
+      if (!ok) return;
     } else {
       const ta = editor as HTMLTextAreaElement;
       const current = ta.value;
@@ -943,17 +1631,21 @@ async function fillAndSend(result: string, autoSend = false) {
     const delay = Math.random() * (max - min) + min;
 
     showCountdownToast(delay, () => {
+      debugLog('自动发送倒计时结束', { adapter: adapter.id, delayMs: Math.round(delay) });
       const checkAndClick = (attempts = 0) => {
         if (attempts > 50) {
           const ed = getCurrentEditor(editorSel);
+          debugLog('未命中发送按钮，回退 Enter 提交', { adapter: adapter.id });
           if (ed) ed.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
           return;
         }
         const currentEditor = getCurrentEditor(editorSel);
         const sendBtn = currentEditor ? getSendButtonForEditor(currentEditor, sendBtnSel) : querySelectorFirst(sendBtnSel);
         if (sendBtn) {
+          debugLog('命中发送按钮并点击', { adapter: adapter.id, attempts, text: (sendBtn.textContent || '').trim().slice(0, 60) });
           sendBtn.click();
         } else {
+          if (attempts === 0 || attempts % 10 === 0) debugLog('等待发送按钮出现', { adapter: adapter.id, attempts });
           setTimeout(() => checkAndClick(attempts + 1), 100);
         }
       };

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"io/fs"
 	"log"
@@ -21,9 +22,10 @@ import (
 )
 
 type Server struct {
-	config   *types.Config
-	router   *gin.Engine
-	executor *executor.Executor
+	config         *types.Config
+	router         *gin.Engine
+	executor       *executor.Executor
+	imageJobBridge *imageJobBridge
 }
 
 func New(config *types.Config) *Server {
@@ -31,9 +33,10 @@ func New(config *types.Config) *Server {
 	router := gin.Default()
 
 	s := &Server{
-		config:   config,
-		router:   router,
-		executor: executor.New(config),
+		config:         config,
+		router:         router,
+		executor:       executor.New(config),
+		imageJobBridge: newImageJobBridge(config.RootDir, config.Token),
 	}
 
 	s.setupRoutes()
@@ -62,6 +65,12 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/prompt", s.handlePrompt)
 	s.router.GET("/skills", s.handleListSkills)
 	s.router.GET("/files", s.handleListFiles)
+	s.router.GET("/bridge/image-jobs/next", s.handleImageJobNext)
+	s.router.POST("/bridge/image-jobs/:id/result", s.handleImageJobResult)
+	s.router.GET("/v1/models", s.handleOpenAIModels)
+	s.router.POST("/v1/chat/completions", s.handleOpenAIChatCompletions)
+	s.router.POST("/v1/images/generations", s.handleOpenAIImageGeneration)
+	s.router.GET("/generated/*path", s.handleGeneratedAsset)
 }
 
 func (s *Server) handleHealth(c *gin.Context) {
@@ -246,4 +255,131 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		return nil
 	})
 	c.JSON(http.StatusOK, gin.H{"files": files})
+}
+
+type openAIImageGenerationRequest struct {
+	Prompt         string `json:"prompt"`
+	Model          string `json:"model"`
+	Size           string `json:"size"`
+	ResponseFormat string `json:"response_format"`
+}
+
+func (s *Server) handleOpenAIImageGeneration(c *gin.Context) {
+	var req openAIImageGenerationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+		return
+	}
+	if strings.TrimSpace(req.Prompt) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "prompt is required"})
+		return
+	}
+	if req.ResponseFormat == "" {
+		req.ResponseFormat = "url"
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), s.openAITimeout())
+	defer cancel()
+
+	job, result, err := s.imageJobBridge.enqueueAndWait(ctx, req.Prompt, req.Model, req.Size, req.ResponseFormat)
+	if err != nil {
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "image generation timed out", "details": err.Error()})
+		return
+	}
+
+	url := buildGeneratedAssetURL(c, result.StoredRelPath, s.config.Token)
+	item := gin.H{
+		"url":            url,
+		"revised_prompt": job.Prompt,
+	}
+	if req.ResponseFormat == "b64_json" || req.ResponseFormat == "url+b64_json" {
+		item["b64_json"] = base64.StdEncoding.EncodeToString(result.Data)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"created": time.Now().Unix(),
+		"data":    []gin.H{item},
+	})
+}
+
+func (s *Server) openAITimeout() time.Duration {
+	const minOpenAITimeout = 5 * time.Minute
+	cfgTimeout := time.Duration(s.config.Timeout) * time.Second
+	if cfgTimeout < minOpenAITimeout {
+		return minOpenAITimeout
+	}
+	return cfgTimeout
+}
+
+func (s *Server) handleImageJobNext(c *gin.Context) {
+	job := s.imageJobBridge.nextJob()
+	if job == nil {
+		c.JSON(http.StatusOK, gin.H{"job": nil})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"job": gin.H{
+			"id":              job.ID,
+			"prompt":          job.Prompt,
+			"model":           job.Model,
+			"size":            job.Size,
+			"response_format": job.ResponseFormat,
+			"created_at":      job.CreatedAt.Unix(),
+		},
+	})
+}
+
+func (s *Server) handleImageJobResult(c *gin.Context) {
+	var req struct {
+		FileName string `json:"file_name"`
+		MimeType string `json:"mime_type"`
+		Data     string `json:"data"`
+		Error    string `json:"error"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+		return
+	}
+	jobID := c.Param("id")
+	if strings.TrimSpace(req.Error) != "" {
+		s.imageJobBridge.fail(jobID)
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+		return
+	}
+	payload, err := base64.StdEncoding.DecodeString(req.Data)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid base64 payload"})
+		return
+	}
+	result, err := s.imageJobBridge.complete(jobID, req.FileName, req.MimeType, payload)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":   true,
+		"path": result.StoredRelPath,
+	})
+}
+
+func (s *Server) handleGeneratedAsset(c *gin.Context) {
+	relPath := strings.TrimPrefix(c.Param("path"), "/")
+	if relPath == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	fullPath := filepath.Join(s.config.RootDir, ".openlink", "generated", filepath.Base(relPath))
+	if _, err := os.Stat(fullPath); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.File(fullPath)
+}
+
+func buildGeneratedAssetURL(c *gin.Context, relPath, token string) string {
+	scheme := "http"
+	if c.Request.TLS != nil {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s/generated/%s?token=%s", scheme, c.Request.Host, strings.TrimPrefix(relPath, ".openlink/generated/"), token)
 }
