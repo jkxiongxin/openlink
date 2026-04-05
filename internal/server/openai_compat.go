@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -23,10 +24,15 @@ var openAIModelCatalog = []openAIModelInfo{
 	{ID: "labs-google-fx-image", Object: "model", OwnedBy: "openlink", Description: "Alias of labs-google-fx for image generation"},
 }
 
+var markdownImageURLRe = regexp.MustCompile(`!\[[^\]]*\]\(([^)\s]+)`)
+
 type chatCompletionRequest struct {
-	Model    string                  `json:"model"`
-	Messages []chatCompletionMessage `json:"messages"`
-	Stream   bool                    `json:"stream"`
+	Model           string                  `json:"model"`
+	Messages        []chatCompletionMessage `json:"messages"`
+	Stream          bool                    `json:"stream"`
+	Image           referenceImageInputs    `json:"image"`
+	Images          referenceImageInputs    `json:"images"`
+	ReferenceImages referenceImageInputs    `json:"reference_images"`
 }
 
 type chatCompletionMessage struct {
@@ -47,7 +53,7 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
-	prompt := extractPromptFromMessages(req.Messages)
+	prompt, referenceInputs := extractPromptAndReferencesFromMessages(req.Messages)
 	if strings.TrimSpace(prompt) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "messages must contain user text content"})
 		return
@@ -57,7 +63,14 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), s.openAITimeout())
 	defer cancel()
 
-	job, result, err := s.imageJobBridge.enqueueAndWait(ctx, prompt, model, "", "url")
+	referenceInputs = normalizeReferenceImageInputs(referenceInputs, req.Image, req.Images, req.ReferenceImages)
+	referenceImages, err := resolveReferenceImages(ctx, s.config.RootDir, referenceInputs)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid reference images", "details": err.Error()})
+		return
+	}
+
+	job, result, err := s.imageJobBridge.enqueueAndWait(ctx, prompt, model, "", "url", referenceImages)
 	if err != nil {
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "image generation timed out", "details": err.Error()})
 		return
@@ -130,37 +143,148 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 	})
 }
 
-func extractPromptFromMessages(messages []chatCompletionMessage) string {
-	var parts []string
-	for _, msg := range messages {
-		if msg.Role != "user" {
-			continue
-		}
-		switch content := msg.Content.(type) {
-		case string:
-			if text := strings.TrimSpace(content); text != "" {
-				parts = append(parts, text)
-			}
-		case []interface{}:
-			for _, item := range content {
-				obj, ok := item.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				itemType, _ := obj["type"].(string)
-				if itemType == "text" {
-					if text, ok := obj["text"].(string); ok && strings.TrimSpace(text) != "" {
-						parts = append(parts, strings.TrimSpace(text))
-					}
-				}
-			}
-		case map[string]interface{}:
-			if text, ok := content["text"].(string); ok && strings.TrimSpace(text) != "" {
-				parts = append(parts, strings.TrimSpace(text))
-			}
+func extractPromptAndReferencesFromMessages(messages []chatCompletionMessage) (string, []referenceImageInput) {
+	if len(messages) == 0 {
+		return "", nil
+	}
+
+	lastUserIndex := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			lastUserIndex = i
+			break
 		}
 	}
+	if lastUserIndex == -1 {
+		return "", nil
+	}
+
+	prompt, references := extractPromptAndReferencesFromContent(messages[lastUserIndex].Content)
+	references = appendHistoricalAssistantReferenceImages(references, messages[:lastUserIndex])
+	return prompt, references
+}
+
+func extractPromptAndReferencesFromContent(content interface{}) (string, []referenceImageInput) {
+	var parts []string
+	var references []referenceImageInput
+	appendChatContent(content, &parts, &references)
+	return strings.Join(parts, "\n\n"), references
+}
+
+func extractTextFromChatContent(content interface{}) string {
+	var parts []string
+	appendTextOnly(content, &parts)
 	return strings.Join(parts, "\n\n")
+}
+
+func appendTextOnly(content interface{}, parts *[]string) {
+	switch value := content.(type) {
+	case string:
+		if text := strings.TrimSpace(value); text != "" {
+			*parts = append(*parts, text)
+		}
+	case []interface{}:
+		for _, item := range value {
+			appendTextOnly(item, parts)
+		}
+	case map[string]interface{}:
+		if text, ok := value["text"].(string); ok && strings.TrimSpace(text) != "" {
+			*parts = append(*parts, strings.TrimSpace(text))
+		}
+		if rawContent, ok := value["content"]; ok {
+			appendTextOnly(rawContent, parts)
+		}
+	}
+}
+
+func appendChatContent(content interface{}, parts *[]string, references *[]referenceImageInput) {
+	switch value := content.(type) {
+	case string:
+		if text := strings.TrimSpace(value); text != "" {
+			*parts = append(*parts, text)
+		}
+	case []interface{}:
+		for _, item := range value {
+			appendChatContent(item, parts, references)
+		}
+	case map[string]interface{}:
+		appendChatContentItem(value, parts, references)
+	}
+}
+
+func appendChatContentItem(item map[string]interface{}, parts *[]string, references *[]referenceImageInput) {
+	itemType, _ := item["type"].(string)
+	switch itemType {
+	case "", "text", "input_text":
+		if text, ok := item["text"].(string); ok && strings.TrimSpace(text) != "" {
+			*parts = append(*parts, strings.TrimSpace(text))
+		}
+	case "image_url", "input_image":
+		if ref := extractReferenceImageFromChatItem(item); ref.URL != "" || ref.Path != "" || ref.Data != "" {
+			*references = append(*references, ref)
+		}
+	}
+}
+
+func extractReferenceImageFromChatItem(item map[string]interface{}) referenceImageInput {
+	if raw, ok := item["file_data"]; ok {
+		switch value := raw.(type) {
+		case string:
+			return referenceImageInputFromString(value)
+		case map[string]interface{}:
+			return referenceImageInputFromMap(map[string]any(value))
+		}
+	}
+	if raw, ok := item["fileData"]; ok {
+		switch value := raw.(type) {
+		case string:
+			return referenceImageInputFromString(value)
+		case map[string]interface{}:
+			return referenceImageInputFromMap(map[string]any(value))
+		}
+	}
+	if raw, ok := item["image_url"]; ok {
+		switch value := raw.(type) {
+		case string:
+			return referenceImageInputFromString(value)
+		case map[string]interface{}:
+			return referenceImageInputFromMap(map[string]any(value))
+		}
+	}
+	if raw, ok := item["input_image"]; ok {
+		switch value := raw.(type) {
+		case string:
+			return referenceImageInputFromString(value)
+		case map[string]interface{}:
+			return referenceImageInputFromMap(map[string]any(value))
+		}
+	}
+	return referenceImageInputFromMap(map[string]any(item))
+}
+
+func appendHistoricalAssistantReferenceImages(references []referenceImageInput, messages []chatCompletionMessage) []referenceImageInput {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role != "assistant" {
+			continue
+		}
+		content := extractTextFromChatContent(msg.Content)
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		matches := markdownImageURLRe.FindAllStringSubmatch(content, -1)
+		if len(matches) == 0 {
+			continue
+		}
+		for j := len(matches) - 1; j >= 0; j-- {
+			imageURL := strings.TrimSpace(matches[j][1])
+			if imageURL == "" {
+				continue
+			}
+			return append([]referenceImageInput{referenceImageInputFromString(imageURL)}, references...)
+		}
+	}
+	return references
 }
 
 func normalizeOpenAIModel(model string) string {

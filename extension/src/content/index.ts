@@ -434,6 +434,9 @@ let debugModeEnabled = false;
 let debugLogSeq = 0;
 let debugPanelLogEl: HTMLPreElement | null = null;
 const debugLogs: string[] = [];
+let labsFxAPIHeaders: Record<string, string> = {};
+let labsFxProjectId = '';
+let labsFxReferencesInjectedReady = false;
 
 function formatDebugValue(value: unknown): string {
   if (value == null) return '';
@@ -477,6 +480,28 @@ if (!(window as any).__OPENLINK_LOADED__) {
   window.addEventListener('message', (event) => {
     if (event.data.type === 'TOOL_CALL') {
       execQueue = execQueue.then(() => executeToolCall(event.data.data));
+    } else if (event.data.type === 'OPENLINK_FLOW_CONTEXT') {
+      const payload = event.data.data || {};
+      const headers = payload.headers && typeof payload.headers === 'object' ? payload.headers : {};
+      if (headers.authorization) {
+        labsFxAPIHeaders = {
+          ...labsFxAPIHeaders,
+          ...headers,
+        };
+        debugLog('labsfx 已捕获页面 API 认证头', {
+          keys: Object.keys(labsFxAPIHeaders),
+          authPrefix: String(headers.authorization).slice(0, 24),
+        });
+      }
+      if (typeof payload.projectId === 'string' && payload.projectId) {
+        labsFxProjectId = payload.projectId;
+        debugLog('labsfx 已捕获项目 ID', { projectId: labsFxProjectId });
+      }
+    } else if (event.data.type === 'OPENLINK_FLOW_REFERENCES_READY') {
+      labsFxReferencesInjectedReady = (event.data.data?.count || 0) > 0;
+      debugLog('labsfx 已下发待注入参考图', { count: event.data.data?.count || 0 });
+    } else if (event.data.type === 'OPENLINK_FLOW_GENERATE_PATCHED') {
+      debugLog('labsfx 已将参考图注入生成请求', { count: event.data.data?.count || 0 });
     }
   });
 
@@ -869,6 +894,8 @@ function collectDebugData() {
     nearbyButtons: getNearbyButtons(currentEditor).map((el) => elementSnapshot(el)),
     latestResponses: responseNodes.map((el) => elementSnapshot(el)),
     latestToolContainers: toolNodes.map((el) => elementSnapshot(el)),
+    labsFxProjectId,
+    labsFxAPIHeaderKeys: Object.keys(labsFxAPIHeaders),
     debugLogs: [...debugLogs],
   };
 }
@@ -1043,11 +1070,20 @@ async function runLabsFxImageJob(job: any, apiUrl: string, authToken: string) {
   debugLog('labsfx 开始执行任务', { id: job.id });
   const editor = await waitForElement<HTMLElement>('div[role="textbox"][data-slate-editor="true"][contenteditable="true"]', 20000);
   debugLog('labsfx 已定位输入框');
-  const beforeKeys = getLabsFxTileKeys();
-  debugLog('labsfx 生成前图片 key 集合', beforeKeys);
+  const referenceImages = Array.isArray(job.reference_images) ? job.reference_images : [];
+  await prepareLabsFxPromptArea(editor);
+  if (referenceImages.length > 0) {
+    debugLog('labsfx 开始附加参考图', { count: referenceImages.length });
+    await attachLabsFxReferenceImages(editor, referenceImages);
+    debugLog('labsfx 参考图附加完成', { count: getLabsFxReferenceCardCount(editor) });
+  } else {
+    debugLog('labsfx 本次任务无参考图');
+  }
   await setLabsFxPrompt(editor, String(job.prompt));
   debugLog('labsfx Prompt 已写入', { prompt: String(job.prompt).slice(0, 120), editorText: getEditorText(editor).slice(0, 120) });
   await sleep(300);
+  const beforeKeys = getLabsFxTileKeys();
+  debugLog('labsfx 提交前图片 key 集合', beforeKeys);
   const sendBtn = getSendButtonForEditor(editor, getSiteConfig().sendBtn);
   if (!sendBtn) throw new Error('labs.google/fx send button not found');
   debugLog('labsfx 已定位发送按钮', { text: (sendBtn.textContent || '').trim().slice(0, 60) });
@@ -1124,19 +1160,6 @@ function setContentEditableText(el: HTMLElement, text: string) {
 
 async function setLabsFxPrompt(editor: HTMLElement, text: string) {
   debugLog('labsfx 开始写入 Prompt', { text: text.slice(0, 120) });
-  const clearBtn = Array.from(editor.parentElement?.parentElement?.querySelectorAll('button') || []).find((btn) => {
-    return (btn.textContent || '').includes('清除提示');
-  }) as HTMLElement | undefined;
-  if (clearBtn && isVisibleElement(clearBtn)) {
-    debugLog('labsfx 点击清除提示');
-    await clickElementLikeUser(clearBtn);
-    await sleep(120);
-  }
-
-  clearLabsFxEditor(editor);
-  debugLog('labsfx 已清空输入框');
-  await sleep(100);
-
   pasteIntoLabsFxEditor(editor, text);
   await sleep(150);
   debugLog('labsfx paste 后校验', {
@@ -1177,6 +1200,22 @@ async function setLabsFxPrompt(editor: HTMLElement, text: string) {
   debugLog('labsfx Prompt 写入成功');
 }
 
+async function prepareLabsFxPromptArea(editor: HTMLElement) {
+  const clearBtn = Array.from(editor.parentElement?.parentElement?.querySelectorAll('button') || []).find((btn) => {
+    return (btn.textContent || '').includes('清除提示');
+  }) as HTMLElement | undefined;
+  if (clearBtn && isVisibleElement(clearBtn)) {
+    debugLog('labsfx 点击清除提示');
+    await clickElementLikeUser(clearBtn);
+    await sleep(200);
+  }
+
+  await clearLabsFxReferenceImages(editor);
+  clearLabsFxEditor(editor);
+  debugLog('labsfx 已清空输入框');
+  await sleep(100);
+}
+
 function clearLabsFxEditor(editor: HTMLElement) {
   editor.focus();
   const selection = window.getSelection();
@@ -1190,6 +1229,274 @@ function clearLabsFxEditor(editor: HTMLElement) {
   editor.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'deleteContentBackward', data: null }));
   editor.dispatchEvent(new Event('input', { bubbles: true }));
   editor.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function getLabsFxReferenceCardCount(editor: HTMLElement): number {
+  const region = (editor.closest('.sc-84e494b2-0') ?? defaultEditorRegion(editor)) as Element | null;
+  if (!region) return 0;
+  return region.querySelectorAll('button[data-card-open] img[alt*="收录在集合中"], button[data-card-open] img[alt*="媒体内容"]').length;
+}
+
+function getLabsFxProjectId(): string {
+  if (labsFxProjectId) return labsFxProjectId;
+  const pathMatch = location.pathname.match(/\/project\/([^/]+)/);
+  return pathMatch?.[1] || '';
+}
+
+function getLabsFxUploadHeaders(): Record<string, string> | null {
+  if (!labsFxAPIHeaders.authorization) return null;
+  return {
+    ...labsFxAPIHeaders,
+    'content-type': 'application/json',
+  };
+}
+
+async function uploadLabsFxReferenceImageViaAPI(item: any, index: number): Promise<string | null> {
+  const projectId = getLabsFxProjectId();
+  const headers = getLabsFxUploadHeaders();
+  if (!projectId || !headers) {
+    debugLog('labsfx API 上传条件不足，回退 UI 上传', {
+      hasProjectId: !!projectId,
+      headerKeys: Object.keys(labsFxAPIHeaders),
+    });
+    return null;
+  }
+
+  const mimeType = typeof item?.mime_type === 'string' && item.mime_type ? item.mime_type : 'image/png';
+  const fileName = typeof item?.file_name === 'string' && item.file_name ? item.file_name : `reference-${index + 1}${guessImageExtension(mimeType, '')}`;
+  const data = typeof item?.data === 'string' ? item.data : '';
+  if (!data) return null;
+
+  const body = {
+    clientContext: {
+      tool: 'PINHOLE',
+      projectId,
+    },
+    fileName,
+    imageBytes: data,
+    isHidden: false,
+    isUserUploaded: true,
+    mimeType,
+  };
+
+  debugLog('labsfx 开始 API 上传参考图', { index: index + 1, fileName, projectId });
+  const resp = await bgFetch('https://aisandbox-pa.googleapis.com/v1/flow/uploadImage', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    debugLog('labsfx API 上传失败', { index: index + 1, status: resp.status, body: resp.body.slice(0, 400) });
+    return null;
+  }
+
+  let payload: any = {};
+  try { payload = JSON.parse(resp.body || '{}'); } catch {}
+  const mediaId = payload?.media?.name || payload?.mediaGenerationId?.mediaGenerationId || '';
+  if (!mediaId) {
+    debugLog('labsfx API 上传返回缺少 mediaId', { index: index + 1, body: resp.body.slice(0, 400) });
+    return null;
+  }
+  debugLog('labsfx API 上传成功', { index: index + 1, mediaId });
+  return mediaId;
+}
+
+function setPendingLabsFxReferenceInputs(mediaIds: string[]) {
+  labsFxReferencesInjectedReady = false;
+  window.postMessage({
+    type: 'OPENLINK_SET_PENDING_FLOW_REFERENCES',
+    data: {
+      items: mediaIds.map((mediaId) => ({ mediaId })),
+    },
+  }, '*');
+}
+
+async function waitForLabsFxPendingReferencesReady(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (labsFxReferencesInjectedReady) return true;
+    await sleep(100);
+  }
+  return false;
+}
+
+async function clearLabsFxReferenceImages(editor: HTMLElement) {
+  const region = (editor.closest('.sc-84e494b2-0') ?? defaultEditorRegion(editor)) as Element | null;
+  if (!region) return;
+
+  for (let pass = 0; pass < 3; pass++) {
+    const count = getLabsFxReferenceCardCount(editor);
+    if (count === 0) return;
+    debugLog('labsfx 清理参考图', { pass, count });
+    const cancelIcons = Array.from(region.querySelectorAll<HTMLElement>('.google-symbols')).filter((el) => (el.textContent || '').trim() === 'cancel');
+    if (cancelIcons.length === 0) break;
+    for (const icon of cancelIcons) {
+      const target = (icon.parentElement as HTMLElement | null) ?? icon;
+      await clickElementLikeUser(target);
+      await sleep(120);
+    }
+    await sleep(300);
+  }
+
+  const remaining = getLabsFxReferenceCardCount(editor);
+  if (remaining > 0) debugLog('labsfx 参考图未完全清理', { remaining });
+}
+
+function findLabsFxFileInput(): HTMLInputElement | null {
+  return Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]')).find((input) => input.isConnected) ?? null;
+}
+
+function getLabsFxAddButton(editor: HTMLElement): HTMLElement | null {
+  const region = (editor.closest('.sc-84e494b2-0') ?? defaultEditorRegion(editor)) as Element | null;
+  if (!region) return null;
+  return Array.from(region.querySelectorAll<HTMLElement>('button')).find((btn) => btn.querySelector('.google-symbols')?.textContent?.trim() === 'add_2') ?? null;
+}
+
+async function ensureLabsFxFileInput(editor: HTMLElement): Promise<HTMLInputElement | null> {
+  const existing = findLabsFxFileInput();
+  if (existing) return existing;
+  const addBtn = getLabsFxAddButton(editor);
+  if (!addBtn) return null;
+  await clickElementLikeUser(addBtn);
+  await sleep(250);
+  return findLabsFxFileInput();
+}
+
+function setFileInputFiles(input: HTMLInputElement, files: File[]) {
+  const dataTransfer = new DataTransfer();
+  for (const file of files) dataTransfer.items.add(file);
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files')?.set;
+  if (setter) setter.call(input, dataTransfer.files);
+  else Object.defineProperty(input, 'files', { configurable: true, value: dataTransfer.files });
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function base64ToBytes(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function referenceImageJobToFile(item: any, index: number): File {
+  const mimeType = typeof item?.mime_type === 'string' && item.mime_type ? item.mime_type : 'image/png';
+  const fileName = typeof item?.file_name === 'string' && item.file_name ? item.file_name : `reference-${index + 1}${guessImageExtension(mimeType, '')}`;
+  const data = typeof item?.data === 'string' ? item.data : '';
+  const bytes = base64ToBytes(data);
+  return new File([bytes], fileName, { type: mimeType });
+}
+
+async function waitForLabsFxReferenceCount(editor: HTMLElement, expectedCount: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (getLabsFxReferenceCardCount(editor) >= expectedCount) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
+async function waitForLabsFxNewResourceTile(previousKeys: string[], timeoutMs: number): Promise<HTMLElement | null> {
+  const before = new Set(previousKeys);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const tile of getLabsFxVisibleResourceTiles()) {
+      const key = tile.getAttribute('data-tile-id') || tile.querySelector('img[alt="生成的图片"]')?.getAttribute('src') || '';
+      if (key && !before.has(key)) return tile;
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+async function attachLabsFxUploadedResourceTile(editor: HTMLElement, tile: HTMLElement, expectedCount: number): Promise<boolean> {
+  const key = tile.getAttribute('data-tile-id') || '';
+  const clickTargets = [
+    tile.querySelector<HTMLElement>('[role="button"]'),
+    tile.querySelector<HTMLElement>('a'),
+    tile,
+  ].filter(Boolean) as HTMLElement[];
+
+  for (const target of clickTargets) {
+    debugLog('labsfx 尝试附着已上传资源卡片', {
+      key,
+      target: target.tagName.toLowerCase(),
+      role: target.getAttribute('role') || '',
+    });
+    await clickElementLikeUser(target);
+    if (await waitForLabsFxReferenceCount(editor, expectedCount, 2500)) return true;
+  }
+  return false;
+}
+
+function dispatchLabsFxPasteFile(target: HTMLElement, file: File) {
+  const dataTransfer = new DataTransfer();
+  dataTransfer.items.add(file);
+  try {
+    target.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dataTransfer, bubbles: true, cancelable: true }));
+  } catch {}
+}
+
+function dispatchLabsFxDropFile(target: HTMLElement, file: File) {
+  const dataTransfer = new DataTransfer();
+  dataTransfer.items.add(file);
+  const eventInit = { bubbles: true, cancelable: true, dataTransfer } as DragEventInit;
+  for (const type of ['dragenter', 'dragover', 'drop']) {
+    try {
+      target.dispatchEvent(new DragEvent(type, eventInit));
+    } catch {}
+  }
+}
+
+async function attachLabsFxReferenceImages(editor: HTMLElement, items: any[]) {
+  const target = (editor.closest('.sc-84e494b2-0') as HTMLElement | null) ?? editor;
+  const uploadedMediaIds: string[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const file = referenceImageJobToFile(items[i], i);
+    const beforeCount = getLabsFxReferenceCardCount(editor);
+    const beforeKeys = getLabsFxTileKeys();
+    debugLog('labsfx 附加参考图', { index: i + 1, beforeCount, fileName: file.name, size: file.size, type: file.type });
+
+    const mediaId = await uploadLabsFxReferenceImageViaAPI(items[i], i);
+    if (mediaId) {
+      uploadedMediaIds.push(mediaId);
+      if (await waitForLabsFxReferenceCount(editor, beforeCount + 1, 1500)) continue;
+      const newTile = await waitForLabsFxNewResourceTile(beforeKeys, 4000);
+      if (newTile) {
+        const key = newTile.getAttribute('data-tile-id') || '';
+        debugLog('labsfx API 上传后发现新资源卡片', { index: i + 1, mediaId, key });
+      }
+      continue;
+    }
+
+    const input = await ensureLabsFxFileInput(editor);
+    if (input) {
+      debugLog('labsfx 使用文件输入上传参考图', { index: i + 1 });
+      setFileInputFiles(input, [file]);
+      if (await waitForLabsFxReferenceCount(editor, beforeCount + 1, 15000)) continue;
+      debugLog('labsfx 文件输入上传未生效，准备回退', { index: i + 1 });
+    }
+
+    debugLog('labsfx 使用 paste 上传参考图', { index: i + 1 });
+    dispatchLabsFxPasteFile(editor, file);
+    if (await waitForLabsFxReferenceCount(editor, beforeCount + 1, 15000)) continue;
+    debugLog('labsfx paste 上传未生效，准备回退', { index: i + 1 });
+
+    debugLog('labsfx 使用 drop 上传参考图', { index: i + 1 });
+    dispatchLabsFxDropFile(target, file);
+    if (await waitForLabsFxReferenceCount(editor, beforeCount + 1, 15000)) continue;
+
+    debugLog('labsfx 参考图附加失败', { index: i + 1, fileName: file.name });
+    throw new Error(`labs.google/fx reference image attach failed: ${file.name}`);
+  }
+
+  if (uploadedMediaIds.length > 0) {
+    debugLog('labsfx 准备注入已上传参考图到生成请求', { count: uploadedMediaIds.length });
+    setPendingLabsFxReferenceInputs(uploadedMediaIds);
+    if (!await waitForLabsFxPendingReferencesReady(2000)) {
+      throw new Error('labs.google/fx pending reference injection setup failed');
+    }
+  }
 }
 
 function pasteIntoLabsFxEditor(editor: HTMLElement, text: string) {
@@ -1250,26 +1557,17 @@ function getLatestLabsFxImage(): HTMLImageElement | null {
 }
 
 function getLatestLabsFxTile(): HTMLElement | null {
-  const tiles = Array.from(document.querySelectorAll<HTMLElement>('[data-tile-id]')).filter((tile) => {
-    if (!isVisibleElement(tile)) return false;
-    return !!tile.querySelector('img[alt="生成的图片"]');
-  });
-  return tiles[0] ?? tiles.at(-1) ?? null;
+  return getLabsFxVisibleResourceTiles()[0] ?? null;
 }
 
 function getLabsFxTileKeys(): string[] {
-  return Array.from(document.querySelectorAll<HTMLElement>('[data-tile-id]'))
-    .filter((tile) => isVisibleElement(tile) && !!tile.querySelector('img[alt="生成的图片"]'))
+  return getLabsFxVisibleResourceTiles()
     .map((tile) => tile.getAttribute('data-tile-id') || tile.querySelector('img[alt="生成的图片"]')?.getAttribute('src') || '')
     .filter(Boolean);
 }
 
 function getLabsFxNewTile(previousKeys: Set<string>): { tile: HTMLElement; key: string; img: HTMLImageElement } | null {
-  const tiles = Array.from(document.querySelectorAll<HTMLElement>('[data-tile-id]')).filter((tile) => {
-    if (!isVisibleElement(tile)) return false;
-    return !!tile.querySelector('img[alt="生成的图片"]');
-  });
-  for (const tile of tiles) {
+  for (const tile of getLabsFxVisibleResourceTiles()) {
     const img = tile.querySelector('img[alt="生成的图片"]') as HTMLImageElement | null;
     if (!img) continue;
     const key = tile.getAttribute('data-tile-id') || img.getAttribute('src') || '';
@@ -1277,6 +1575,20 @@ function getLabsFxNewTile(previousKeys: Set<string>): { tile: HTMLElement; key: 
     return { tile, key, img };
   }
   return null;
+}
+
+function getLabsFxVisibleResourceTiles(): HTMLElement[] {
+  const seen = new Set<string>();
+  const tiles: HTMLElement[] = [];
+  for (const tile of Array.from(document.querySelectorAll<HTMLElement>('[data-tile-id]'))) {
+    if (!isVisibleElement(tile)) continue;
+    if (!tile.querySelector('img[alt="生成的图片"]')) continue;
+    const key = tile.getAttribute('data-tile-id') || tile.querySelector('img[alt="生成的图片"]')?.getAttribute('src') || '';
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    tiles.push(tile);
+  }
+  return tiles;
 }
 
 async function waitForNewLabsFxImage(previousKeysInput: string[] | Set<string>, timeoutMs: number): Promise<HTMLImageElement> {

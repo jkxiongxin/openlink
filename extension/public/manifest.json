@@ -8,7 +8,7 @@
     "type": "module"
   },
   "permissions": ["activeTab", "storage", "tabs"],
-  "host_permissions": ["http://127.0.0.1:*/*", "https://labs.google/*", "https://storage.googleapis.com/*"],
+  "host_permissions": ["http://127.0.0.1:*/*", "https://labs.google/*", "https://storage.googleapis.com/*", "https://aisandbox-pa.googleapis.com/*"],
   "action": {
     "default_popup": "popup.html"
   },

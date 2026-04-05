@@ -258,10 +258,13 @@ func (s *Server) handleListFiles(c *gin.Context) {
 }
 
 type openAIImageGenerationRequest struct {
-	Prompt         string `json:"prompt"`
-	Model          string `json:"model"`
-	Size           string `json:"size"`
-	ResponseFormat string `json:"response_format"`
+	Prompt          string               `json:"prompt"`
+	Model           string               `json:"model"`
+	Size            string               `json:"size"`
+	ResponseFormat  string               `json:"response_format"`
+	ReferenceImages referenceImageInputs `json:"reference_images"`
+	Image           referenceImageInputs `json:"image"`
+	Images          referenceImageInputs `json:"images"`
 }
 
 func (s *Server) handleOpenAIImageGeneration(c *gin.Context) {
@@ -281,7 +284,15 @@ func (s *Server) handleOpenAIImageGeneration(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), s.openAITimeout())
 	defer cancel()
 
-	job, result, err := s.imageJobBridge.enqueueAndWait(ctx, req.Prompt, req.Model, req.Size, req.ResponseFormat)
+	model := normalizeOpenAIModel(req.Model)
+	referenceInputs := normalizeReferenceImageInputs(req.ReferenceImages, req.Image, req.Images)
+	referenceImages, err := resolveReferenceImages(ctx, s.config.RootDir, referenceInputs)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid reference images", "details": err.Error()})
+		return
+	}
+
+	job, result, err := s.imageJobBridge.enqueueAndWait(ctx, req.Prompt, model, req.Size, req.ResponseFormat, referenceImages)
 	if err != nil {
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "image generation timed out", "details": err.Error()})
 		return
@@ -324,7 +335,18 @@ func (s *Server) handleImageJobNext(c *gin.Context) {
 			"model":           job.Model,
 			"size":            job.Size,
 			"response_format": job.ResponseFormat,
-			"created_at":      job.CreatedAt.Unix(),
+			"reference_images": func() []gin.H {
+				items := make([]gin.H, 0, len(job.ReferenceImages))
+				for _, ref := range job.ReferenceImages {
+					items = append(items, gin.H{
+						"file_name": ref.FileName,
+						"mime_type": ref.MimeType,
+						"data":      base64.StdEncoding.EncodeToString(ref.Data),
+					})
+				}
+				return items
+			}(),
+			"created_at": job.CreatedAt.Unix(),
 		},
 	})
 }

@@ -13,12 +13,19 @@ import (
 )
 
 type imageJob struct {
-	ID             string
-	Prompt         string
-	Model          string
-	Size           string
-	ResponseFormat string
-	CreatedAt      time.Time
+	ID              string
+	Prompt          string
+	Model           string
+	Size            string
+	ResponseFormat  string
+	ReferenceImages []imageJobReference
+	CreatedAt       time.Time
+}
+
+type imageJobReference struct {
+	FileName string
+	MimeType string
+	Data     []byte
 }
 
 type imageJobResult struct {
@@ -47,15 +54,16 @@ func newImageJobBridge(rootDir, token string) *imageJobBridge {
 	}
 }
 
-func (b *imageJobBridge) enqueueAndWait(ctx context.Context, prompt, model, size, responseFormat string) (*imageJob, *imageJobResult, error) {
+func (b *imageJobBridge) enqueueAndWait(ctx context.Context, prompt, model, size, responseFormat string, references []imageJobReference) (*imageJob, *imageJobResult, error) {
 	id := fmt.Sprintf("img_%d_%d", time.Now().Unix(), b.idCounter.Add(1))
 	job := &imageJob{
-		ID:             id,
-		Prompt:         prompt,
-		Model:          model,
-		Size:           size,
-		ResponseFormat: responseFormat,
-		CreatedAt:      time.Now(),
+		ID:              id,
+		Prompt:          prompt,
+		Model:           model,
+		Size:            size,
+		ResponseFormat:  responseFormat,
+		ReferenceImages: cloneImageJobReferences(references),
+		CreatedAt:       time.Now(),
 	}
 	ch := make(chan *imageJobResult, 1)
 
@@ -83,6 +91,22 @@ func (b *imageJobBridge) enqueueAndWait(ctx context.Context, prompt, model, size
 		b.mu.Unlock()
 		return nil, nil, ctx.Err()
 	}
+}
+
+func cloneImageJobReferences(items []imageJobReference) []imageJobReference {
+	if len(items) == 0 {
+		return nil
+	}
+	cloned := make([]imageJobReference, 0, len(items))
+	for _, item := range items {
+		data := append([]byte(nil), item.Data...)
+		cloned = append(cloned, imageJobReference{
+			FileName: item.FileName,
+			MimeType: item.MimeType,
+			Data:     data,
+		})
+	}
+	return cloned
 }
 
 func (b *imageJobBridge) nextJob() *imageJob {
