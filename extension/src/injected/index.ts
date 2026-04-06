@@ -41,6 +41,7 @@ function tryParseToolJSON(raw: string): any | null {
 
 (function() {
   console.log('[OpenLink] 插件已加载');
+  const FLOW_RECAPTCHA_WEBSITE_KEY = '6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV';
   const originalFetch = window.fetch;
   const OriginalXHR = window.XMLHttpRequest;
   let buffer = '';
@@ -48,6 +49,8 @@ function tryParseToolJSON(raw: string): any | null {
   let pendingFlowReferenceKind = 'image';
   let geminiMediaSeq = 0;
   let geminiMediaCaptureActive = false;
+  let flowCapturedHeaders = {};
+  let flowCapturedProjectId = '';
 
   // Global dedup: keyed by conversation ID extracted from URL
   const processedByConv = new Map<string, Set<string>>();
@@ -74,7 +77,11 @@ function tryParseToolJSON(raw: string): any | null {
   function isFlowAPIRequest(url: string): boolean {
     return url.includes('aisandbox-pa.googleapis.com/v1/') ||
       url.includes('/flow/uploadImage') ||
-      url.includes('/flowMedia:batchGenerateImages');
+      url.includes('/flowMedia:batchGenerateImages') ||
+      url.includes('/video:batchAsyncGenerateVideoText') ||
+      url.includes('/video:batchAsyncGenerateVideoReferenceImages') ||
+      url.includes('/video:batchAsyncGenerateVideoStartAndEndImage') ||
+      url.includes('/video:batchAsyncGenerateVideoStartImage');
   }
 
   function bodyProjectId(body: any): string {
@@ -131,6 +138,17 @@ function tryParseToolJSON(raw: string): any | null {
           name: mediaId,
           imageInputType: 'IMAGE_INPUT_TYPE_REFERENCE',
         };
+      })
+      .filter(Boolean);
+  }
+
+  function normalizePendingFlowVideoReferenceItems(items) {
+    if (!Array.isArray(items)) return [];
+    return items
+      .map((item) => {
+        const mediaId = typeof item?.mediaId === 'string' ? item.mediaId.trim() : '';
+        if (!mediaId) return null;
+        return { mediaId };
       })
       .filter(Boolean);
   }
@@ -226,9 +244,11 @@ function tryParseToolJSON(raw: string): any | null {
       if (videoRefs.length >= 2) {
         nextURL = url.replace('/video:batchAsyncGenerateVideoText', '/video:batchAsyncGenerateVideoStartAndEndImage');
         nextURL = nextURL.replace('/video:batchAsyncGenerateVideoReferenceImages', '/video:batchAsyncGenerateVideoStartAndEndImage');
+        nextURL = nextURL.replace('/video:batchAsyncGenerateVideoStartImage', '/video:batchAsyncGenerateVideoStartAndEndImage');
       } else if (videoRefs.length === 1) {
-        nextURL = url.replace('/video:batchAsyncGenerateVideoText', '/video:batchAsyncGenerateVideoReferenceImages');
-        nextURL = nextURL.replace('/video:batchAsyncGenerateVideoStartAndEndImage', '/video:batchAsyncGenerateVideoReferenceImages');
+        nextURL = url.replace('/video:batchAsyncGenerateVideoText', '/video:batchAsyncGenerateVideoStartImage');
+        nextURL = nextURL.replace('/video:batchAsyncGenerateVideoReferenceImages', '/video:batchAsyncGenerateVideoStartImage');
+        nextURL = nextURL.replace('/video:batchAsyncGenerateVideoStartAndEndImage', '/video:batchAsyncGenerateVideoStartImage');
       }
 
       const patchRequest = (request) => {
@@ -240,6 +260,13 @@ function tryParseToolJSON(raw: string): any | null {
             endImage: { mediaId: videoRefs[1].mediaId },
           };
           delete next.referenceImages;
+        } else if (videoRefs.length === 1) {
+          next = {
+            ...next,
+            startImage: { mediaId: videoRefs[0].mediaId },
+          };
+          delete next.referenceImages;
+          delete next.endImage;
         } else {
           next = {
             ...next,
@@ -267,6 +294,7 @@ function tryParseToolJSON(raw: string): any | null {
         data: {
           count: pendingFlowReferenceInputs.length,
           mediaKind: 'video',
+          url: nextURL,
         },
       }, '*');
       pendingFlowReferenceInputs = [];
@@ -285,7 +313,8 @@ function tryParseToolJSON(raw: string): any | null {
     const isVideoGenerate =
       url.includes('/video:batchAsyncGenerateVideoText') ||
       url.includes('/video:batchAsyncGenerateVideoReferenceImages') ||
-      url.includes('/video:batchAsyncGenerateVideoStartAndEndImage');
+      url.includes('/video:batchAsyncGenerateVideoStartAndEndImage') ||
+      url.includes('/video:batchAsyncGenerateVideoStartImage');
     if ((!isImageGenerate && !isVideoGenerate) || !pendingFlowReferenceInputs.length) {
       return args;
     }
@@ -367,7 +396,20 @@ function tryParseToolJSON(raw: string): any | null {
 
       const captured = normalizeCapturedHeaders(headers);
       const projectId = extractProjectId(url, bodyText);
+      if (Object.keys(captured).length) flowCapturedHeaders = { ...flowCapturedHeaders, ...captured };
+      if (projectId) flowCapturedProjectId = projectId;
       if (!captured.authorization && !projectId) return;
+
+      if (url.includes('/video:') || url.includes('/flowMedia:batchGenerateImages')) {
+        postInjectedDebug('labsfx fetch 请求命中', {
+          url: url.slice(0, 180),
+          projectId,
+          hasAuthorization: !!captured.authorization,
+          pendingCount: pendingFlowReferenceInputs.length,
+          pendingKind: pendingFlowReferenceKind,
+          bodyLength: bodyText.length,
+        });
+      }
 
       window.postMessage({
         type: 'OPENLINK_FLOW_CONTEXT',
@@ -378,6 +420,145 @@ function tryParseToolJSON(raw: string): any | null {
         },
       }, '*');
     } catch {}
+  }
+
+  function postInjectedDebug(message: string, meta?: any) {
+    window.postMessage({
+      type: 'OPENLINK_DEBUG_LOG',
+      data: {
+        source: 'injected',
+        message,
+        meta: meta || {},
+      },
+    }, '*');
+  }
+
+  async function ensureFlowRecaptchaReady() {
+    const ready = () => (
+      typeof window.grecaptcha !== 'undefined' &&
+      !!window.grecaptcha.enterprise &&
+      typeof window.grecaptcha.enterprise.execute === 'function'
+    );
+    if (ready()) return;
+
+    let script = document.querySelector(`script[src*="recaptcha/enterprise.js?render=${FLOW_RECAPTCHA_WEBSITE_KEY}"]`);
+    if (!script) {
+      script = document.createElement('script');
+      script.src = `https://www.google.com/recaptcha/enterprise.js?render=${FLOW_RECAPTCHA_WEBSITE_KEY}`;
+      script.async = true;
+      script.defer = true;
+      (document.head || document.documentElement).appendChild(script);
+    }
+
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      if (ready()) return;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error('grecaptcha enterprise not ready');
+  }
+
+  async function executeFlowRecaptcha(action: string) {
+    await ensureFlowRecaptchaReady();
+    return await new Promise((resolve, reject) => {
+      try {
+        window.grecaptcha.enterprise.ready(() => {
+          window.grecaptcha.enterprise.execute(FLOW_RECAPTCHA_WEBSITE_KEY, { action })
+            .then((token) => resolve(token))
+            .catch((error) => reject(error));
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  async function directGenerateFlowVideo(payload: any) {
+    const projectId = String(payload?.projectId || flowCapturedProjectId || '').trim();
+    const referenceMediaIds = Array.isArray(payload?.referenceMediaIds)
+      ? payload.referenceMediaIds.map((value) => String(value || '').trim()).filter(Boolean)
+      : [];
+    const prompt = String(payload?.prompt || '');
+    const headersFromPayload = payload?.headers && typeof payload.headers === 'object' ? payload.headers : {};
+    const headers = {
+      ...flowCapturedHeaders,
+      ...headersFromPayload,
+    };
+    if (!projectId) throw new Error('missing Flow projectId');
+    if (!headers.authorization) throw new Error('missing Flow authorization header');
+    if (!prompt.trim()) throw new Error('missing Flow prompt');
+    if (!referenceMediaIds.length) throw new Error('missing Flow reference media ids');
+
+    const recaptchaToken = String(await executeFlowRecaptcha('VIDEO_GENERATION') || '');
+    if (!recaptchaToken) throw new Error('failed to obtain VIDEO_GENERATION recaptcha token');
+
+    let url = 'https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoStartImage';
+    const requestData: any = {
+      aspectRatio: String(payload?.aspectRatio || 'VIDEO_ASPECT_RATIO_LANDSCAPE'),
+      seed: Math.floor(Math.random() * 99999) + 1,
+      textInput: {
+        structuredPrompt: {
+          parts: [{ text: prompt }],
+        },
+      },
+      videoModelKey: String(payload?.videoModelKey || 'veo_3_1_i2v_s_fast_fl'),
+      metadata: {
+        sceneId: typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random()}`,
+      },
+    };
+    if (referenceMediaIds.length >= 2) {
+      url = 'https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoStartAndEndImage';
+      requestData.startImage = { mediaId: referenceMediaIds[0] };
+      requestData.endImage = { mediaId: referenceMediaIds[1] };
+    } else {
+      requestData.startImage = { mediaId: referenceMediaIds[0] };
+    }
+
+    const body = {
+      clientContext: {
+        recaptchaContext: {
+          token: recaptchaToken,
+          applicationType: 'RECAPTCHA_APPLICATION_TYPE_WEB',
+        },
+        sessionId: typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random()}`,
+        projectId,
+        tool: 'PINHOLE',
+        userPaygateTier: 'PAYGATE_TIER_ONE',
+      },
+      requests: [requestData],
+      mediaGenerationContext: {
+        batchId: typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random()}`,
+      },
+      useV2ModelConfig: true,
+    };
+
+    const requestHeaders: Record<string, string> = {
+      ...headers,
+      'content-type': 'application/json',
+    };
+    const response = await originalFetch(url, {
+      method: 'POST',
+      headers: requestHeaders,
+      body: JSON.stringify(body),
+    });
+    const responseText = await response.text();
+    if (!response.ok) {
+      throw new Error(`direct video generate failed: HTTP ${response.status} ${responseText.slice(0, 200)}`);
+    }
+    let responseJSON = null;
+    try { responseJSON = JSON.parse(responseText); } catch {}
+    return {
+      status: response.status,
+      url,
+      body: responseText,
+      json: responseJSON,
+    };
   }
 
   function parseGeminiInnerJSON(raw: string) {
@@ -522,8 +703,10 @@ function tryParseToolJSON(raw: string): any | null {
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     if (event.data?.type === 'OPENLINK_SET_PENDING_FLOW_REFERENCES') {
-      pendingFlowReferenceInputs = normalizePendingFlowReferenceInputs(event.data?.data?.items);
       pendingFlowReferenceKind = event.data?.data?.mediaKind === 'video' ? 'video' : 'image';
+      pendingFlowReferenceInputs = pendingFlowReferenceKind === 'video'
+        ? normalizePendingFlowVideoReferenceItems(event.data?.data?.items)
+        : normalizePendingFlowReferenceInputs(event.data?.data?.items);
       window.postMessage({
         type: 'OPENLINK_FLOW_REFERENCES_READY',
         data: {
@@ -534,6 +717,37 @@ function tryParseToolJSON(raw: string): any | null {
     } else if (event.data?.type === 'OPENLINK_SET_GEMINI_MEDIA_CAPTURE') {
       geminiMediaCaptureActive = !!event.data?.data?.active;
       if (!geminiMediaCaptureActive) geminiMediaSeq = 0;
+    } else if (event.data?.type === 'OPENLINK_LABSFX_DIRECT_VIDEO_START') {
+      const requestId = String(event.data?.data?.requestId || '');
+      void directGenerateFlowVideo(event.data?.data || {})
+        .then((result) => {
+          postInjectedDebug('labsfx 直连视频生成请求已发出', {
+            requestId,
+            url: result.url,
+            status: result.status,
+            operations: Array.isArray(result.json?.operations) ? result.json.operations.length : 0,
+          });
+          window.postMessage({
+            type: 'OPENLINK_LABSFX_DIRECT_VIDEO_STARTED',
+            data: {
+              requestId,
+              url: result.url,
+              status: result.status,
+              result: result.json,
+            },
+          }, '*');
+        })
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          postInjectedDebug('labsfx 直连视频生成请求失败', { requestId, error: message });
+          window.postMessage({
+            type: 'OPENLINK_LABSFX_DIRECT_VIDEO_ERROR',
+            data: {
+              requestId,
+              error: message,
+            },
+          }, '*');
+        });
     }
   });
 
@@ -587,13 +801,74 @@ function tryParseToolJSON(raw: string): any | null {
   function patchXHR() {
     const originalOpen = OriginalXHR.prototype.open;
     const originalSend = OriginalXHR.prototype.send;
+    const originalSetRequestHeader = OriginalXHR.prototype.setRequestHeader;
 
     OriginalXHR.prototype.open = function(method, url, ...rest) {
       this.__openlink_url = typeof url === 'string' ? url : String(url);
+      this.__openlink_method = method;
+      this.__openlink_open_rest = rest;
+      this.__openlink_headers = this.__openlink_headers || {};
       return originalOpen.call(this, method, url, ...rest);
     };
 
+    OriginalXHR.prototype.setRequestHeader = function(name, value) {
+      try {
+        this.__openlink_headers = this.__openlink_headers || {};
+        this.__openlink_headers[String(name).toLowerCase()] = String(value);
+      } catch {}
+      return originalSetRequestHeader.call(this, name, value);
+    };
+
     OriginalXHR.prototype.send = function(...args) {
+      try {
+        const url = this.__openlink_url || '';
+        const body = typeof args[0] === 'string' ? args[0] : '';
+        const isImageGenerate = url.includes('/flowMedia:batchGenerateImages');
+        const isVideoGenerate =
+          url.includes('/video:batchAsyncGenerateVideoText') ||
+          url.includes('/video:batchAsyncGenerateVideoReferenceImages') ||
+          url.includes('/video:batchAsyncGenerateVideoStartAndEndImage') ||
+          url.includes('/video:batchAsyncGenerateVideoStartImage');
+
+        if (isImageGenerate || isVideoGenerate) {
+          postInjectedDebug('labsfx xhr 请求命中', {
+            url: url.slice(0, 180),
+            pendingCount: pendingFlowReferenceInputs.length,
+            pendingKind: pendingFlowReferenceKind,
+            bodyLength: body.length,
+          });
+        }
+
+        if ((isImageGenerate || isVideoGenerate) && pendingFlowReferenceInputs.length && body) {
+          if (isImageGenerate) {
+            const patched = patchFlowGenerateBody(body);
+            if (patched.patched) {
+              args[0] = patched.bodyText;
+            }
+          } else {
+            const patched = patchFlowVideoGenerateBody(url, body);
+            if (patched.patched) {
+              if (patched.url && patched.url !== url) {
+                originalOpen.call(
+                  this,
+                  this.__openlink_method || 'POST',
+                  patched.url,
+                  ...(Array.isArray(this.__openlink_open_rest) ? this.__openlink_open_rest : [])
+                );
+                const headers = this.__openlink_headers || {};
+                for (const [key, value] of Object.entries(headers)) {
+                  try {
+                    originalSetRequestHeader.call(this, key, value);
+                  } catch {}
+                }
+                this.__openlink_url = patched.url;
+              }
+              args[0] = patched.bodyText;
+            }
+          }
+        }
+      } catch {}
+
       this.addEventListener('readystatechange', function() {
         try {
           if (this.readyState !== 4) return;
