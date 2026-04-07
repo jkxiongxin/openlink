@@ -11,6 +11,7 @@ $VERSION = $response.Headers.Location -replace ".*/tag/", ""
 if (-not $VERSION) { Write-Error "获取版本失败"; exit 1 }
 
 $FILE = "${BIN}-windows-${ARCH}.zip"
+$EXTRACTED_BIN = "${BIN}-windows-${ARCH}.exe"
 $URL = "https://github.com/$REPO/releases/download/$VERSION/$FILE"
 
 Write-Host "正在安装 openlink $VERSION (windows/$ARCH)..."
@@ -21,7 +22,7 @@ New-Item -ItemType Directory -Force -Path $TMP | Out-Null
 
 Invoke-WebRequest -Uri $URL -OutFile "$TMP\openlink.zip"
 Expand-Archive -Path "$TMP\openlink.zip" -DestinationPath $TMP -Force
-Move-Item -Force "$TMP\$BIN.exe" "$INSTALL_DIR\$BIN.exe"
+Move-Item -Force "$TMP\$EXTRACTED_BIN" "$INSTALL_DIR\$BIN.exe"
 Remove-Item -Recurse -Force $TMP
 
 # 添加到用户 PATH
