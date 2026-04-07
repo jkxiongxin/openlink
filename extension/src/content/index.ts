@@ -442,6 +442,8 @@ let labsFxReferencesInjectedReady = false;
 let labsFxGeneratePatchedSeq = 0;
 let geminiLatestMediaURLs: string[] = [];
 let geminiMediaSeq = 0;
+let extensionContextInvalidated = false;
+let extensionContextInvalidatedLogged = false;
 
 function formatDebugValue(value: unknown): string {
   if (value == null) return '';
@@ -534,7 +536,7 @@ if (!(window as any).__OPENLINK_LOADED__) {
       });
     } else if (event.data.type === 'OPENLINK_GEMINI_MEDIA_FOUND') {
       geminiLatestMediaURLs = Array.isArray(event.data.data?.urls) ? event.data.data.urls : [];
-      geminiMediaSeq = Number(event.data.data?.seq || (geminiMediaSeq + 1));
+      geminiMediaSeq += 1;
       debugLog('gemini 已捕获无水印媒体 URL', {
         seq: geminiMediaSeq,
         count: geminiLatestMediaURLs.length,
@@ -1046,11 +1048,55 @@ function injectDebugPanel() {
 }
 
 async function bgFetch(url: string, options?: any): Promise<{ ok: boolean; status: number; body: string }> {
-  return chrome.runtime.sendMessage({ type: 'FETCH', url, options });
+  assertExtensionContextActive();
+  try {
+    return await chrome.runtime.sendMessage({ type: 'FETCH', url, options });
+  } catch (error) {
+    handleExtensionContextError(error);
+    throw error;
+  }
 }
 
 async function bgFetchBinary(url: string, options?: any): Promise<{ ok: boolean; status: number; bodyBase64: string; contentType: string; finalUrl: string; error?: string }> {
-  return chrome.runtime.sendMessage({ type: 'FETCH_BINARY', url, options });
+  assertExtensionContextActive();
+  try {
+    return await chrome.runtime.sendMessage({ type: 'FETCH_BINARY', url, options });
+  } catch (error) {
+    handleExtensionContextError(error);
+    throw error;
+  }
+}
+
+function isExtensionContextInvalidatedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return message.includes('Extension context invalidated');
+}
+
+function handleExtensionContextError(error: unknown) {
+  if (!isExtensionContextInvalidatedError(error)) return;
+  extensionContextInvalidated = true;
+  if (!extensionContextInvalidatedLogged) {
+    extensionContextInvalidatedLogged = true;
+    debugLog('扩展上下文已失效，停止后台轮询，刷新页面或重载扩展后恢复');
+  }
+}
+
+function assertExtensionContextActive() {
+  if (extensionContextInvalidated || !chrome?.runtime?.id) {
+    const error = new Error('Extension context invalidated');
+    handleExtensionContextError(error);
+    throw error;
+  }
+}
+
+async function getStoredConfig(keys: string[]) {
+  assertExtensionContextActive();
+  try {
+    return await chrome.storage.local.get(keys);
+  } catch (error) {
+    handleExtensionContextError(error);
+    throw error;
+  }
 }
 
 let labsFxWorkerStarted = false;
@@ -1060,12 +1106,13 @@ function startLabsFxImageWorker() {
   labsFxWorkerStarted = true;
   debugLog('labs.google/fx worker 已启动');
   let running = false;
+  let stopped = false;
 
   const tick = async () => {
-    if (running) return;
+    if (running || stopped || extensionContextInvalidated) return;
     running = true;
     try {
-      const { authToken, apiUrl } = await chrome.storage.local.get(['authToken', 'apiUrl']);
+      const { authToken, apiUrl } = await getStoredConfig(['authToken', 'apiUrl']);
       if (!authToken || !apiUrl) {
         debugLog('labsfx 跳过轮询，缺少配置', { hasAuthToken: !!authToken, hasApiUrl: !!apiUrl });
         return;
@@ -1099,6 +1146,11 @@ function startLabsFxImageWorker() {
         throw err;
       }
     } catch (err) {
+      handleExtensionContextError(err);
+      if (extensionContextInvalidated) {
+        stopped = true;
+        return;
+      }
       console.warn('[OpenLink] labs.google/fx media worker error:', err);
       debugLog('labsfx worker 异常', err instanceof Error ? err.message : String(err));
     } finally {
@@ -1107,7 +1159,13 @@ function startLabsFxImageWorker() {
   };
 
   void tick();
-  window.setInterval(() => { void tick(); }, 2500);
+  const intervalId = window.setInterval(() => {
+    if (stopped || extensionContextInvalidated) {
+      window.clearInterval(intervalId);
+      return;
+    }
+    void tick();
+  }, 2500);
 }
 
 async function runLabsFxMediaJob(job: any, apiUrl: string, authToken: string) {
@@ -1186,13 +1244,14 @@ async function runLabsFxMediaJob(job: any, apiUrl: string, authToken: string) {
 
 function startGeminiImageWorker() {
   let running = false;
+  let stopped = false;
   debugLog('gemini 图片 worker 已启动');
 
   const tick = async () => {
-    if (running) return;
+    if (running || stopped || extensionContextInvalidated) return;
     running = true;
     try {
-      const { authToken, apiUrl } = await chrome.storage.local.get(['authToken', 'apiUrl']);
+      const { authToken, apiUrl } = await getStoredConfig(['authToken', 'apiUrl']);
       if (!authToken || !apiUrl) {
         debugLog('gemini 跳过轮询，缺少配置', { hasAuthToken: !!authToken, hasApiUrl: !!apiUrl });
         return;
@@ -1226,6 +1285,11 @@ function startGeminiImageWorker() {
         throw err;
       }
     } catch (err) {
+      handleExtensionContextError(err);
+      if (extensionContextInvalidated) {
+        stopped = true;
+        return;
+      }
       console.warn('[OpenLink] gemini image worker error:', err);
       debugLog('gemini worker 异常', err instanceof Error ? err.message : String(err));
     } finally {
@@ -1234,7 +1298,13 @@ function startGeminiImageWorker() {
   };
 
   void tick();
-  window.setInterval(() => { void tick(); }, 2500);
+  const intervalId = window.setInterval(() => {
+    if (stopped || extensionContextInvalidated) {
+      window.clearInterval(intervalId);
+      return;
+    }
+    void tick();
+  }, 2500);
 }
 
 async function runGeminiImageJob(job: any, apiUrl: string, authToken: string) {
@@ -1242,6 +1312,7 @@ async function runGeminiImageJob(job: any, apiUrl: string, authToken: string) {
   try {
     showToast(`Gemini 开始生成图片: ${job.id}`, 2500);
     debugLog('gemini 开始执行图片任务', { id: job.id });
+    geminiLatestMediaURLs = [];
     const editor = await waitForElement<HTMLElement>('div.ql-editor[contenteditable="true"]', 20000);
     debugLog('gemini 已定位输入框');
     const beforeKeys = getGeminiImageKeys();

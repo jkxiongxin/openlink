@@ -723,7 +723,6 @@ function tryParseToolJSON(raw: string): any | null {
       }, '*');
     } else if (event.data?.type === 'OPENLINK_SET_GEMINI_MEDIA_CAPTURE') {
       geminiMediaCaptureActive = !!event.data?.data?.active;
-      if (!geminiMediaCaptureActive) geminiMediaSeq = 0;
     } else if (event.data?.type === 'OPENLINK_LABSFX_DIRECT_VIDEO_START') {
       const requestId = String(event.data?.data?.requestId || '');
       void directGenerateFlowVideo(event.data?.data || {})
