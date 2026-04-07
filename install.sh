@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="afumu/openlink"
+REPO="jkxiongxin/openlink"
 BIN="openlink"
 INSTALL_DIR="/usr/local/bin"
 
@@ -18,12 +18,14 @@ if [ -z "$VERSION" ]; then
   echo "获取版本失败"; exit 1
 fi
 
-FILE="${BIN}_${OS}_${ARCH}.tar.gz"
+FILE="${BIN}-${OS}-${ARCH}.zip"
 URL="https://github.com/${REPO}/releases/download/${VERSION}/${FILE}"
 
 echo "正在安装 openlink ${VERSION} (${OS}/${ARCH})..."
 TMP=$(mktemp -d)
-curl -fsSL "$URL" | tar -xz -C "$TMP"
+ARCHIVE="$TMP/$FILE"
+curl -fsSL "$URL" -o "$ARCHIVE"
+unzip -q "$ARCHIVE" -d "$TMP"
 
 if [ -w "$INSTALL_DIR" ]; then
   mv "$TMP/$BIN" "$INSTALL_DIR/$BIN"

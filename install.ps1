@@ -1,16 +1,16 @@
 $ErrorActionPreference = "Stop"
 
-$REPO = "afumu/openlink"
+$REPO = "jkxiongxin/openlink"
 $BIN = "openlink"
 $INSTALL_DIR = "$env:USERPROFILE\.openlink"
 
-$ARCH = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
+$ARCH = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { throw "不支持的架构: 386" }
 
 $response = Invoke-WebRequest -Uri "https://github.com/$REPO/releases/latest" -MaximumRedirection 0 -ErrorAction SilentlyContinue
 $VERSION = $response.Headers.Location -replace ".*/tag/", ""
 if (-not $VERSION) { Write-Error "获取版本失败"; exit 1 }
 
-$FILE = "${BIN}_windows_${ARCH}.zip"
+$FILE = "${BIN}-windows-${ARCH}.zip"
 $URL = "https://github.com/$REPO/releases/download/$VERSION/$FILE"
 
 Write-Host "正在安装 openlink $VERSION (windows/$ARCH)..."
