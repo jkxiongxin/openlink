@@ -27,6 +27,33 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - run: gh release upload ${{ github.ref_name }} /tmp/extension-dist.zip
+      - name: Build Windows installer archives
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import shutil
+          import tempfile
+          import zipfile
+
+          root = pathlib.Path.cwd()
+          dist = root / "dist"
+          for arch in ("amd64", "arm64"):
+              source = dist / f"openlink_windows_{arch}.zip"
+              if not source.exists():
+                  raise SystemExit(f"missing {source}")
+
+              with tempfile.TemporaryDirectory() as tmpdir:
+                  tmp = pathlib.Path(tmpdir)
+                  with zipfile.ZipFile(source) as zf:
+                      zf.extractall(tmp)
+                  shutil.copy2(root / "install.ps1", tmp / "install.ps1")
+
+                  target = pathlib.Path("/tmp") / f"openlink_windows_{arch}_installer.zip"
+                  with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                      for path in tmp.rglob("*"):
+                          if path.is_file():
+                              zf.write(path, path.relative_to(tmp))
+          PY
+      - run: gh release upload ${{ github.ref_name }} /tmp/extension-dist.zip /tmp/openlink_windows_amd64_installer.zip /tmp/openlink_windows_arm64_installer.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

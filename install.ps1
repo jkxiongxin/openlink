@@ -2,34 +2,80 @@ $ErrorActionPreference = "Stop"
 
 $REPO = "afumu/openlink"
 $BIN = "openlink"
-$INSTALL_DIR = "$env:USERPROFILE\.openlink"
+$INSTALL_DIR = Join-Path $env:USERPROFILE ".openlink"
 
-$ARCH = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
-
-$response = Invoke-WebRequest -Uri "https://github.com/$REPO/releases/latest" -MaximumRedirection 0 -ErrorAction SilentlyContinue
-$VERSION = $response.Headers.Location -replace ".*/tag/", ""
-if (-not $VERSION) { Write-Error "获取版本失败"; exit 1 }
-
-$FILE = "${BIN}_windows_${ARCH}.zip"
-$URL = "https://github.com/$REPO/releases/download/$VERSION/$FILE"
-
-Write-Host "正在安装 openlink $VERSION (windows/$ARCH)..."
-
-New-Item -ItemType Directory -Force -Path $INSTALL_DIR | Out-Null
-$TMP = Join-Path $env:TEMP "openlink_install"
-New-Item -ItemType Directory -Force -Path $TMP | Out-Null
-
-Invoke-WebRequest -Uri $URL -OutFile "$TMP\openlink.zip"
-Expand-Archive -Path "$TMP\openlink.zip" -DestinationPath $TMP -Force
-Move-Item -Force "$TMP\$BIN.exe" "$INSTALL_DIR\$BIN.exe"
-Remove-Item -Recurse -Force $TMP
-
-# 添加到用户 PATH
-$path = [Environment]::GetEnvironmentVariable("PATH", "User")
-if ($path -notlike "*$INSTALL_DIR*") {
-    [Environment]::SetEnvironmentVariable("PATH", "$path;$INSTALL_DIR", "User")
-    Write-Host "已添加 $INSTALL_DIR 到 PATH（重新打开终端生效）"
+function Get-Arch {
+    if ([Environment]::Is64BitOperatingSystem) {
+        return "amd64"
+    }
+    return "386"
 }
 
-Write-Host "安装完成: $INSTALL_DIR\$BIN.exe"
-Write-Host "运行 'openlink' 启动服务"
+function Get-LatestVersion {
+    param([string]$Repo)
+
+    $response = Invoke-WebRequest -Uri "https://github.com/$Repo/releases/latest" -MaximumRedirection 0 -ErrorAction SilentlyContinue
+    if (-not $response.Headers.Location) {
+        return $null
+    }
+
+    return $response.Headers.Location -replace ".*/tag/", ""
+}
+
+function Install-FromDirectory {
+    param([string]$SourceDir)
+
+    $sourceExe = Join-Path $SourceDir "$BIN.exe"
+    if (-not (Test-Path $sourceExe)) {
+        throw "Missing $BIN.exe in $SourceDir"
+    }
+
+    New-Item -ItemType Directory -Force -Path $INSTALL_DIR | Out-Null
+    Copy-Item -Force $sourceExe (Join-Path $INSTALL_DIR "$BIN.exe")
+}
+
+function Add-ToUserPath {
+    $current = [Environment]::GetEnvironmentVariable("PATH", "User")
+    $segments = @()
+    if ($current) {
+        $segments = $current -split ';' | Where-Object { $_ -and $_.Trim() }
+    }
+
+    if ($segments -notcontains $INSTALL_DIR) {
+        $nextPath = if ($current) { "$current;$INSTALL_DIR" } else { $INSTALL_DIR }
+        [Environment]::SetEnvironmentVariable("PATH", $nextPath, "User")
+        Write-Host "Added $INSTALL_DIR to the user PATH. Restart the terminal to pick it up."
+    }
+}
+
+$localExe = Join-Path $PSScriptRoot "$BIN.exe"
+if (Test-Path $localExe) {
+    Write-Host "Installing from the extracted release package..."
+    Install-FromDirectory -SourceDir $PSScriptRoot
+} else {
+    $arch = Get-Arch
+    $version = Get-LatestVersion -Repo $REPO
+    if (-not $version) {
+        throw "Failed to determine the latest release version."
+    }
+
+    $file = "${BIN}_windows_${arch}.zip"
+    $url = "https://github.com/$REPO/releases/download/$version/$file"
+    Write-Host "Downloading openlink $version ($arch)..."
+
+    $tmp = Join-Path $env:TEMP "openlink_install"
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        $zipPath = Join-Path $tmp "openlink.zip"
+        Invoke-WebRequest -Uri $url -OutFile $zipPath
+        Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
+        Install-FromDirectory -SourceDir $tmp
+    } finally {
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+Add-ToUserPath
+
+Write-Host "Installed: $INSTALL_DIR\$BIN.exe"
+Write-Host "Run 'openlink' to start the server."
