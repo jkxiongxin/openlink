@@ -1112,8 +1112,9 @@ function startLabsFxImageWorker() {
 
 async function runLabsFxMediaJob(job: any, apiUrl: string, authToken: string) {
   const mediaKind = job?.media_kind === 'video' ? 'video' : 'image';
+  const videoMode = mediaKind === 'video' ? resolveLabsFxVideoMode(job?.model) : 'text';
   showToast(`开始生成${mediaKind === 'video' ? '视频' : '图片'}: ${job.id}`, 2500);
-  debugLog('labsfx 开始执行任务', { id: job.id, mediaKind });
+  debugLog('labsfx 开始执行任务', { id: job.id, mediaKind, videoMode, model: job?.model || '' });
   const editor = await waitForElement<HTMLElement>('div[role="textbox"][data-slate-editor="true"][contenteditable="true"]', 20000);
   debugLog('labsfx 已定位输入框');
   await ensureLabsFxMode(editor, mediaKind);
@@ -1122,7 +1123,7 @@ async function runLabsFxMediaJob(job: any, apiUrl: string, authToken: string) {
   await prepareLabsFxPromptArea(editor);
   if (referenceImages.length > 0) {
     debugLog('labsfx 开始附加参考图', { count: referenceImages.length });
-    uploadedReferenceMediaIds = await attachLabsFxReferenceImages(editor, referenceImages, mediaKind);
+    uploadedReferenceMediaIds = await attachLabsFxReferenceImages(editor, referenceImages, mediaKind, videoMode);
     debugLog('labsfx 参考图附加完成', { count: getLabsFxReferenceCardCount(editor) });
   } else {
     debugLog('labsfx 本次任务无参考图');
@@ -1536,12 +1537,13 @@ async function uploadLabsFxReferenceImageViaAPI(item: any, index: number): Promi
   return mediaId;
 }
 
-function setPendingLabsFxReferenceInputs(mediaIds: string[], mediaKind: 'image' | 'video') {
+function setPendingLabsFxReferenceInputs(mediaIds: string[], mediaKind: 'image' | 'video', videoMode: 'text' | 'reference' | 'start_end' = 'text') {
   labsFxReferencesInjectedReady = false;
   window.postMessage({
     type: 'OPENLINK_SET_PENDING_FLOW_REFERENCES',
     data: {
       mediaKind,
+      videoMode,
       items: mediaIds.map((mediaId) => ({ mediaId })),
     },
   }, '*');
@@ -1625,8 +1627,16 @@ async function triggerDirectLabsFxVideoGenerate(prompt: string, referenceMediaId
 
 function resolveLabsFxVideoModelKey(model: string): string {
   const normalized = String(model || '').trim().toLowerCase();
+  if (normalized.includes('reference')) return 'veo_3_1_r2v_fast_landscape';
   if (normalized.includes('veo')) return 'veo_3_1_i2v_s_fast_fl';
   return 'veo_3_1_i2v_s_fast_fl';
+}
+
+function resolveLabsFxVideoMode(model: string): 'text' | 'reference' | 'start_end' {
+  const normalized = String(model || '').trim().toLowerCase();
+  if (normalized.includes('start-end') || normalized.includes('start_end')) return 'start_end';
+  if (normalized.includes('reference')) return 'reference';
+  return 'reference';
 }
 
 async function pollDirectLabsFxVideoResult(operations: any[]): Promise<string> {
@@ -1822,7 +1832,7 @@ function dispatchLabsFxDropFile(target: HTMLElement, file: File) {
   }
 }
 
-async function attachLabsFxReferenceImages(editor: HTMLElement, items: any[], mediaKind: 'image' | 'video' = 'image'): Promise<string[]> {
+async function attachLabsFxReferenceImages(editor: HTMLElement, items: any[], mediaKind: 'image' | 'video' = 'image', videoMode: 'text' | 'reference' | 'start_end' = 'text'): Promise<string[]> {
   const target = (findLabsFxComposerRegion(editor) as HTMLElement | null) ?? editor;
   const uploadedMediaIds: string[] = [];
   for (let i = 0; i < items.length; i++) {
@@ -1869,8 +1879,8 @@ async function attachLabsFxReferenceImages(editor: HTMLElement, items: any[], me
   }
 
   if (uploadedMediaIds.length > 0) {
-    debugLog('labsfx 准备注入已上传参考图到生成请求', { count: uploadedMediaIds.length, mediaKind });
-    setPendingLabsFxReferenceInputs(uploadedMediaIds, mediaKind);
+    debugLog('labsfx 准备注入已上传参考图到生成请求', { count: uploadedMediaIds.length, mediaKind, videoMode });
+    setPendingLabsFxReferenceInputs(uploadedMediaIds, mediaKind, videoMode);
     if (!await waitForLabsFxPendingReferencesReady(2000)) {
       throw new Error('labs.google/fx pending reference injection setup failed');
     }

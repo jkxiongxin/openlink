@@ -23,7 +23,11 @@ var openAIModelCatalog = []openAIModelInfo{
 	{ID: "labs-google-fx", Object: "model", OwnedBy: "openlink", Description: "Google Labs Flow image generation via browser automation"},
 	{ID: "labs-google-fx-image", Object: "model", OwnedBy: "openlink", Description: "Alias of labs-google-fx for image generation"},
 	{ID: "labs-google-fx-video", Object: "model", OwnedBy: "openlink", Description: "Google Labs Flow video generation via browser automation"},
+	{ID: "labs-google-fx-video-reference", Object: "model", OwnedBy: "openlink", Description: "Google Labs Flow reference-image video generation via browser automation"},
+	{ID: "labs-google-fx-video-start-end", Object: "model", OwnedBy: "openlink", Description: "Google Labs Flow start/end-frame video generation via browser automation"},
 	{ID: "labs-google-fx-veo", Object: "model", OwnedBy: "openlink", Description: "Alias of labs-google-fx-video for video generation"},
+	{ID: "labs-google-fx-veo-reference", Object: "model", OwnedBy: "openlink", Description: "Alias of labs-google-fx-video-reference for reference-image video generation"},
+	{ID: "labs-google-fx-veo-start-end", Object: "model", OwnedBy: "openlink", Description: "Alias of labs-google-fx-video-start-end for start/end-frame video generation"},
 	{ID: "gemini-2.0-flash-preview-image-generation", Object: "model", OwnedBy: "openlink", Description: "Gemini image generation via browser automation"},
 	{ID: "gemini-2.5-flash-image-preview", Object: "model", OwnedBy: "openlink", Description: "Gemini image generation via browser automation"},
 	{ID: "gemini-image", Object: "model", OwnedBy: "openlink", Description: "Alias of Gemini browser image generation"},
@@ -368,6 +372,10 @@ func normalizeOpenAIModel(model string) string {
 		return "labs-google-fx"
 	case "labs-google-fx-veo":
 		return "labs-google-fx-video"
+	case "labs-google-fx-veo-reference":
+		return "labs-google-fx-video-reference"
+	case "labs-google-fx-veo-start-end":
+		return "labs-google-fx-video-start-end"
 	case "gemini-image":
 		return "gemini-2.0-flash-preview-image-generation"
 	default:

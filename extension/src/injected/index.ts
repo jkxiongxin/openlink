@@ -47,6 +47,7 @@ function tryParseToolJSON(raw: string): any | null {
   let buffer = '';
   let pendingFlowReferenceInputs = [];
   let pendingFlowReferenceKind = 'image';
+  let pendingFlowVideoMode = 'text';
   let geminiMediaSeq = 0;
   let geminiMediaCaptureActive = false;
   let flowCapturedHeaders = {};
@@ -241,11 +242,15 @@ function tryParseToolJSON(raw: string): any | null {
       if (!videoRefs.length) return { url, bodyText, patched: false };
 
       let nextURL = url;
-      if (videoRefs.length >= 2) {
+      if (pendingFlowVideoMode === 'start_end') {
         nextURL = url.replace('/video:batchAsyncGenerateVideoText', '/video:batchAsyncGenerateVideoStartAndEndImage');
         nextURL = nextURL.replace('/video:batchAsyncGenerateVideoReferenceImages', '/video:batchAsyncGenerateVideoStartAndEndImage');
         nextURL = nextURL.replace('/video:batchAsyncGenerateVideoStartImage', '/video:batchAsyncGenerateVideoStartAndEndImage');
-      } else if (videoRefs.length === 1) {
+      } else if (pendingFlowVideoMode === 'reference') {
+        nextURL = url.replace('/video:batchAsyncGenerateVideoText', '/video:batchAsyncGenerateVideoReferenceImages');
+        nextURL = nextURL.replace('/video:batchAsyncGenerateVideoStartAndEndImage', '/video:batchAsyncGenerateVideoReferenceImages');
+        nextURL = nextURL.replace('/video:batchAsyncGenerateVideoStartImage', '/video:batchAsyncGenerateVideoReferenceImages');
+      } else {
         nextURL = url.replace('/video:batchAsyncGenerateVideoText', '/video:batchAsyncGenerateVideoStartImage');
         nextURL = nextURL.replace('/video:batchAsyncGenerateVideoReferenceImages', '/video:batchAsyncGenerateVideoStartImage');
         nextURL = nextURL.replace('/video:batchAsyncGenerateVideoStartAndEndImage', '/video:batchAsyncGenerateVideoStartImage');
@@ -253,26 +258,26 @@ function tryParseToolJSON(raw: string): any | null {
 
       const patchRequest = (request) => {
         let next = ensureStructuredVideoTextInput(request);
-        if (videoRefs.length >= 2) {
+        if (pendingFlowVideoMode === 'start_end') {
           next = {
             ...next,
             startImage: { mediaId: videoRefs[0].mediaId },
             endImage: { mediaId: videoRefs[1].mediaId },
           };
           delete next.referenceImages;
-        } else if (videoRefs.length === 1) {
-          next = {
-            ...next,
-            startImage: { mediaId: videoRefs[0].mediaId },
-          };
-          delete next.referenceImages;
-          delete next.endImage;
-        } else {
+        } else if (pendingFlowVideoMode === 'reference') {
           next = {
             ...next,
             referenceImages: videoRefs,
           };
           delete next.startImage;
+          delete next.endImage;
+        } else {
+          next = {
+            ...next,
+            startImage: { mediaId: videoRefs[0].mediaId },
+          };
+          delete next.referenceImages;
           delete next.endImage;
         }
         return next;
@@ -704,6 +709,7 @@ function tryParseToolJSON(raw: string): any | null {
     if (event.source !== window) return;
     if (event.data?.type === 'OPENLINK_SET_PENDING_FLOW_REFERENCES') {
       pendingFlowReferenceKind = event.data?.data?.mediaKind === 'video' ? 'video' : 'image';
+      pendingFlowVideoMode = typeof event.data?.data?.videoMode === 'string' ? event.data.data.videoMode : 'text';
       pendingFlowReferenceInputs = pendingFlowReferenceKind === 'video'
         ? normalizePendingFlowVideoReferenceItems(event.data?.data?.items)
         : normalizePendingFlowReferenceInputs(event.data?.data?.items);
@@ -712,6 +718,7 @@ function tryParseToolJSON(raw: string): any | null {
         data: {
           count: pendingFlowReferenceInputs.length,
           mediaKind: pendingFlowReferenceKind,
+          videoMode: pendingFlowVideoMode,
         },
       }, '*');
     } else if (event.data?.type === 'OPENLINK_SET_GEMINI_MEDIA_CAPTURE') {
