@@ -63,11 +63,16 @@ func AuthMiddleware(token string) gin.HandlerFunc {
 
 		auth := c.GetHeader("Authorization")
 		expected := "Bearer " + token
-		if len(auth) != len(expected) || subtle.ConstantTimeCompare([]byte(auth), []byte(expected)) != 1 {
-			c.JSON(401, gin.H{"error": "unauthorized"})
-			c.Abort()
+		if len(auth) == len(expected) && subtle.ConstantTimeCompare([]byte(auth), []byte(expected)) == 1 {
+			c.Next()
 			return
 		}
-		c.Next()
+		queryToken := c.Query("token")
+		if len(queryToken) == len(token) && subtle.ConstantTimeCompare([]byte(queryToken), []byte(token)) == 1 {
+			c.Next()
+			return
+		}
+		c.JSON(401, gin.H{"error": "unauthorized"})
+		c.Abort()
 	}
 }
