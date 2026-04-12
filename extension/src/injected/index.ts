@@ -438,6 +438,39 @@ function tryParseToolJSON(raw: string): any | null {
     }, '*');
   }
 
+  function extractFlowVideoStatuses(value, results = []) {
+    if (!value) return results;
+    if (Array.isArray(value)) {
+      for (const item of value) extractFlowVideoStatuses(item, results);
+      return results;
+    }
+    if (typeof value === 'object') {
+      const status = typeof value.status === 'string' ? value.status : '';
+      if (status.startsWith('MEDIA_GENERATION_STATUS_')) {
+        results.push({
+          status,
+          error: value.error || value.statusDetail || value.message || null,
+        });
+      }
+      for (const nested of Object.values(value)) extractFlowVideoStatuses(nested, results);
+    }
+    return results;
+  }
+
+  function postFlowVideoStatusIfFound(url, text) {
+    if (!url.includes('/video:batchCheckAsyncVideoGenerationStatus') || !text) return;
+    try {
+      const parsed = JSON.parse(text);
+      const statuses = extractFlowVideoStatuses(parsed, []);
+      if (!statuses.length) return;
+      const current = statuses[statuses.length - 1];
+      window.postMessage({
+        type: 'OPENLINK_LABSFX_VIDEO_STATUS',
+        data: current,
+      }, '*');
+    } catch {}
+  }
+
   async function ensureFlowRecaptchaReady() {
     const ready = () => (
       typeof window.grecaptcha !== 'undefined' &&
@@ -705,6 +738,81 @@ function tryParseToolJSON(raw: string): any | null {
     }, '*');
   }
 
+  function getGeminiReferencePreviewCount() {
+    return Array.from(document.querySelectorAll('button[data-test-id="cancel-button"], button[aria-label*="移除文件"], button[aria-label*="移除图片"], button[aria-label*="Remove file"], button[aria-label*="Remove image"]'))
+      .filter((el) => {
+        if (!(el instanceof HTMLElement)) return true;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      }).length;
+  }
+
+  function base64ToBytes(base64: string) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  async function attachGeminiReferenceInPage(data: any) {
+    const requestId = String(data?.requestId || '');
+    try {
+      const mimeType = typeof data?.mimeType === 'string' && data.mimeType ? data.mimeType : 'image/png';
+      const fileName = typeof data?.fileName === 'string' && data.fileName ? data.fileName : 'reference.png';
+      const dataBase64 = typeof data?.dataBase64 === 'string' ? data.dataBase64 : '';
+      if (!dataBase64) throw new Error('missing base64 data');
+
+      const editor = document.querySelector('div.ql-editor[contenteditable="true"]');
+      const target = document.querySelector('.xap-uploader-dropzone') || editor;
+      if (!(editor instanceof HTMLElement) || !(target instanceof HTMLElement)) {
+        throw new Error('gemini editor/target not found');
+      }
+
+      const bytes = base64ToBytes(dataBase64);
+      const file = new File([bytes], fileName, { type: mimeType });
+      const before = getGeminiReferencePreviewCount();
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+
+      try {
+        editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true }));
+      } catch {}
+      for (const type of ['dragenter', 'dragover', 'drop']) {
+        try {
+          target.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: transfer }));
+        } catch {}
+      }
+
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        const count = getGeminiReferencePreviewCount();
+        if (count > before) {
+          window.postMessage({
+            type: 'OPENLINK_GEMINI_ATTACH_REFERENCE_RESULT',
+            data: {
+              requestId,
+              attached: true,
+              count,
+              mode: 'page-paste-drop',
+            },
+          }, '*');
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      throw new Error('preview count did not increase');
+    } catch (error) {
+      window.postMessage({
+        type: 'OPENLINK_GEMINI_ATTACH_REFERENCE_RESULT',
+        data: {
+          requestId,
+          attached: false,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      }, '*');
+    }
+  }
+
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     if (event.data?.type === 'OPENLINK_SET_PENDING_FLOW_REFERENCES') {
@@ -723,6 +831,8 @@ function tryParseToolJSON(raw: string): any | null {
       }, '*');
     } else if (event.data?.type === 'OPENLINK_SET_GEMINI_MEDIA_CAPTURE') {
       geminiMediaCaptureActive = !!event.data?.data?.active;
+    } else if (event.data?.type === 'OPENLINK_GEMINI_ATTACH_REFERENCE') {
+      void attachGeminiReferenceInPage(event.data?.data || {});
     } else if (event.data?.type === 'OPENLINK_LABSFX_DIRECT_VIDEO_START') {
       const requestId = String(event.data?.data?.requestId || '');
       void directGenerateFlowVideo(event.data?.data || {})
@@ -765,7 +875,8 @@ function tryParseToolJSON(raw: string): any | null {
       captureFlowRequest(nextArgs);
       const response = await originalFetch.apply(this, nextArgs);
       const requestURL = getRequestURL(nextArgs[0]);
-      const reader = response.body!.getReader();
+      if (!response.body) return response;
+      const reader = response.body.getReader();
       let responseTextBuffer = '';
       const stream = new ReadableStream({
         async start(controller) {
@@ -791,6 +902,7 @@ function tryParseToolJSON(raw: string): any | null {
               buffer = buffer.replace(full, '');
             }
             postGeminiMediaIfFound(requestURL, responseTextBuffer);
+            postFlowVideoStatusIfFound(requestURL, responseTextBuffer);
             controller.enqueue(value);
           }
           controller.close();
@@ -882,6 +994,7 @@ function tryParseToolJSON(raw: string): any | null {
           const text = typeof this.responseText === 'string' ? this.responseText : '';
           if (!text) return;
           postGeminiMediaIfFound(url, text);
+          postFlowVideoStatusIfFound(url, text);
         } catch {}
       });
       return originalSend.apply(this, args);
