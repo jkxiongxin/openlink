@@ -25,6 +25,7 @@ node_modules/
 *.swp
 *.swo
 *~
+*.zip
 
 # OS
 .DS_Store
