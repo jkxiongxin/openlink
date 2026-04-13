@@ -615,9 +615,11 @@ func (s *Server) handleTextJobNext(c *gin.Context) {
 	siteID := strings.TrimSpace(c.Query("site_id"))
 	job := s.textJobBridge.nextJob(siteID)
 	if job == nil {
+		log.Printf("[OpenLink][TextJobAPI] next site=%s -> empty", siteID)
 		c.JSON(http.StatusOK, gin.H{"job": nil})
 		return
 	}
+	log.Printf("[OpenLink][TextJobAPI] next site=%s -> job=%s model=%s age=%s prompt_len=%d messages=%d", siteID, job.ID, job.Model, time.Since(job.CreatedAt).Round(time.Millisecond), len(strings.TrimSpace(job.Prompt)), len(job.Messages))
 	c.JSON(http.StatusOK, gin.H{
 		"job": gin.H{
 			"id":         job.ID,
@@ -637,17 +639,21 @@ func (s *Server) handleTextJobResult(c *gin.Context) {
 		Metadata map[string]string `json:"metadata"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[OpenLink][TextJobAPI] result invalid json job=%s err=%v", c.Param("id"), err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
 	jobID := c.Param("id")
 	if strings.TrimSpace(req.Error) != "" {
+		log.Printf("[OpenLink][TextJobAPI] result error job=%s error=%q metadata=%v", jobID, req.Error, req.Metadata)
 		s.textJobBridge.failWithError(jobID, req.Error)
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 		return
 	}
+	log.Printf("[OpenLink][TextJobAPI] result content job=%s content_len=%d metadata=%v", jobID, len(strings.TrimSpace(req.Content)), req.Metadata)
 	result, err := s.textJobBridge.complete(jobID, req.Content, req.Metadata)
 	if err != nil {
+		log.Printf("[OpenLink][TextJobAPI] result complete failed job=%s err=%v", jobID, err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

@@ -12,6 +12,13 @@
     "http://127.0.0.1:*/*",
     "https://chatgpt.com/*",
     "https://*.chatgpt.com/*",
+    "https://claude.ai/*",
+    "https://www.kimi.com/*",
+    "https://*.kimi.com/*",
+    "https://*.moonshot.cn/*",
+    "https://www.perplexity.ai/*",
+    "https://perplexity.ai/*",
+    "https://chat.z.ai/*",
     "https://labs.google/*",
     "https://cdn.qwenlm.ai/*",
     "https://*.qwenlm.ai/*",
@@ -27,7 +34,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://chatgpt.com/*", "*://*.chatgpt.com/*", "*://*.gemini.google.com/*", "*://aistudio.google.com/*", "*://arena.ai/*", "*://chat.deepseek.com/*", "*://tongyi.aliyun.com/*", "*://chat.qwen.ai/*", "*://www.doubao.com/*", "*://doubao.com/*", "*://labs.google/*"],
+      "matches": ["*://chatgpt.com/*", "*://*.chatgpt.com/*", "*://claude.ai/*", "*://www.kimi.com/*", "*://*.kimi.com/*", "*://*.moonshot.cn/*", "*://www.perplexity.ai/*", "*://perplexity.ai/*", "*://chat.z.ai/*", "*://*.gemini.google.com/*", "*://aistudio.google.com/*", "*://arena.ai/*", "*://chat.deepseek.com/*", "*://tongyi.aliyun.com/*", "*://chat.qwen.ai/*", "*://www.doubao.com/*", "*://doubao.com/*", "*://labs.google/*"],
       "js": ["content.js"],
       "run_at": "document_start"
     }
@@ -35,7 +42,7 @@
   "web_accessible_resources": [
     {
       "resources": ["injected.js"],
-      "matches": ["*://chatgpt.com/*", "*://*.chatgpt.com/*", "*://*.gemini.google.com/*", "*://aistudio.google.com/*", "*://arena.ai/*", "*://chat.deepseek.com/*", "*://tongyi.aliyun.com/*", "*://chat.qwen.ai/*", "*://www.doubao.com/*", "*://doubao.com/*", "*://labs.google/*"]
+      "matches": ["*://chatgpt.com/*", "*://*.chatgpt.com/*", "*://claude.ai/*", "*://www.kimi.com/*", "*://*.kimi.com/*", "*://*.moonshot.cn/*", "*://www.perplexity.ai/*", "*://perplexity.ai/*", "*://chat.z.ai/*", "*://*.gemini.google.com/*", "*://aistudio.google.com/*", "*://arena.ai/*", "*://chat.deepseek.com/*", "*://tongyi.aliyun.com/*", "*://chat.qwen.ai/*", "*://www.doubao.com/*", "*://doubao.com/*", "*://labs.google/*"]
     }
   ]
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"regexp"
 	"strings"
@@ -51,11 +52,13 @@ func (s *Server) handleOpenAIModels(c *gin.Context) {
 func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 	var req chatCompletionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[OpenLink][OpenAI] invalid chat completion request: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
 	prompt, referenceInputs := extractPromptAndReferencesFromMessages(req.Messages)
 	if strings.TrimSpace(prompt) == "" {
+		log.Printf("[OpenLink][OpenAI] empty prompt after message extraction model=%q messages=%d", req.Model, len(req.Messages))
 		c.JSON(http.StatusBadRequest, gin.H{"error": "messages must contain user text content"})
 		return
 	}
@@ -64,7 +67,9 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 	completionID := fmt.Sprintf("chatcmpl-%d", created)
 	model := normalizeOpenAIModel(req.Model)
 	modelSpec, modelFound := lookupBrowserModel(req.Model)
+	log.Printf("[OpenLink][OpenAI] chat completion received requested_model=%q normalized_model=%q messages=%d prompt_len=%d stream=%v refs=%d structured=%v found=%v", req.Model, model, len(req.Messages), len(strings.TrimSpace(prompt)), req.Stream, len(referenceInputs), isStructuredBrowserModelID(req.Model), modelFound)
 	if !modelFound && isStructuredBrowserModelID(req.Model) {
+		log.Printf("[OpenLink][OpenAI] unsupported browser model requested: %q", req.Model)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported browser model", "model": req.Model})
 		return
 	}
@@ -215,12 +220,17 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 func (s *Server) handleOpenAITextChatCompletion(c *gin.Context, req chatCompletionRequest, modelSpec browserModelSpec, prompt string, created int64, completionID string) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), s.openAITextTimeout())
 	defer cancel()
+	start := time.Now()
+	textMessages := extractTextJobMessages(req.Messages)
+	log.Printf("[OpenLink][OpenAI] text completion start model=%s site=%s prompt_len=%d messages=%d timeout=%s stream=%v", modelSpec.ID, modelSpec.SiteID, len(strings.TrimSpace(prompt)), len(textMessages), s.openAITextTimeout(), req.Stream)
 
-	job, result, err := s.textJobBridge.enqueueAndWait(ctx, modelSpec.SiteID, prompt, modelSpec.ID, extractTextJobMessages(req.Messages))
+	job, result, err := s.textJobBridge.enqueueAndWait(ctx, modelSpec.SiteID, prompt, modelSpec.ID, textMessages)
 	if err != nil {
+		log.Printf("[OpenLink][OpenAI] text completion failed model=%s site=%s duration=%s err=%v", modelSpec.ID, modelSpec.SiteID, time.Since(start).Round(time.Millisecond), err)
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "browser text completion timed out", "details": err.Error()})
 		return
 	}
+	log.Printf("[OpenLink][OpenAI] text completion success model=%s site=%s job=%s duration=%s content_len=%d metadata=%v", modelSpec.ID, modelSpec.SiteID, job.ID, time.Since(start).Round(time.Millisecond), len(result.Content), result.Metadata)
 
 	if req.Stream {
 		c.Header("Content-Type", "text/event-stream")

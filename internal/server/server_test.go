@@ -216,7 +216,7 @@ func TestHandleOpenAIModelsIncludesTextAndMedia(t *testing.T) {
 	for _, model := range resp.Data {
 		seen[model.ID] = model
 	}
-	for _, id := range []string{"labs-google-fx", "op-qwen-image", "gemini-web/gemini-2.5-pro", "chatgpt-web/gpt-4o", "qwen-web/qwen-plus", "deepseek-web/deepseek-chat", "doubao-web/doubao-seed-2.0"} {
+	for _, id := range []string{"labs-google-fx", "op-qwen-image", "gemini-web/gemini-2.5-pro", "chatgpt-web/gpt-4o", "claude-web/claude-sonnet-4-6", "kimi-web/moonshot-v1-32k", "perplexity-web/perplexity-web", "glm-intl-web/glm-4-plus", "qwen-web/qwen-plus", "deepseek-web/deepseek-chat", "doubao-web/doubao-seed-2.0"} {
 		if _, ok := seen[id]; !ok {
 			t.Fatalf("expected model %q in catalog", id)
 		}

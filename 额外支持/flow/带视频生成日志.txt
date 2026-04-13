@@ -1,0 +1,42 @@
+[00:03:57 #1] 内容脚本已加载 {"adapter":"labsfx","href":"https://labs.google/fx/zh/tools/flow/project/b6a45854-7296-4984-a0de-930eb31d25ae"}
+[00:03:57 #2] 调试模式状态初始化 {"enabled":true}
+[00:03:58 #3] 调试面板已挂载
+[00:03:58 #4] labs.google/fx worker 已启动
+[00:04:01 #5] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:07 #6] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:07 #7] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:08 #8] labsfx 收到媒体任务 {"id":"img_1775491446_21","mediaKind":"video","prompt":"两个美女打架"}
+[00:04:08 #9] labsfx 开始执行任务 {"id":"img_1775491446_21","mediaKind":"video"}
+[00:04:08 #10] labsfx 已定位输入框
+[00:04:08 #11] labsfx 当前已处于视频模式
+[00:04:08 #12] labsfx 已清空输入框
+[00:04:08 #13] labsfx 开始附加参考图 {"count":1}
+[00:04:08 #14] labsfx 附加参考图 {"index":1,"beforeCount":0,"fileName":"image.png","size":1917349,"type":"image/png"}
+[00:04:08 #15] labsfx 开始 API 上传参考图 {"index":1,"fileName":"image.png","projectId":"b6a45854-7296-4984-a0de-930eb31d25ae"}
+[00:04:13 #16] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:21 #17] labsfx API 上传成功 {"index":1,"mediaId":"36bba35e-b9cf-4bd0-a404-4c94891d5c03"}
+[00:04:27 #18] labsfx 准备注入已上传参考图到生成请求 {"count":1,"mediaKind":"video"}
+[00:04:27 #19] labsfx 已下发待注入参考图 {"count":1,"mediaKind":"video"}
+[00:04:27 #20] labsfx 注入准备完成后已刷新输入区状态 {"mediaKind":"video"}
+[00:04:27 #21] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:27 #22] labsfx 参考图附加完成 {"count":0}
+[00:04:27 #23] labsfx 开始写入 Prompt {"text":"两个美女打架"}
+[00:04:27 #24] labsfx paste 后校验 {"plain":"两个美女打架","hasStringNode":true}
+[00:04:27 #25] labsfx Prompt 写入成功
+[00:04:27 #26] labsfx Prompt 已写入 {"prompt":"两个美女打架","editorText":"两个美女打架"}
+[00:04:27 #27] labsfx 已触发输入区刷新以同步参考图状态 {"mediaKind":"video"}
+[00:04:27 #28] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:28 #29] labsfx 提交前媒体 key 集合 ["fe_id_993d7f6b-0577-469f-82c5-d7d054f95183","fe_id_f4dfd09e-eb6b-4e85-abb1-89a12428f3ba","fe_id_dca7a628-a218-46a3-9a1d-ca00bbfc0071","fe_id_3d6e91ac-4249-487c-96c1-5918f2ad0a7a","fe_id_7f435d2f-ebf2-4510-9157-31a6405a2839","fe_id_1f6721a4-66e5-4852-ad51-f8a80a45f5a2","fe_id_52cafaef-0a4b-45e5-974a-0711bc838cb0","fe_id_f72e28d9-85cc-499a-b75f-928927d6fbae","fe_id_0bc8a135-f12a-426d-9604-e406da51e389","fe_id_87751b12-2070-405d-b5ea-cda21a792c5d","fe_id_7b9830d3-c256-49a8-ae20-d5b103429eb2","fe_id_57dbf400-f90d-418c-b09b-6d2ce78a35fc","fe_id_fac7b94e-7607-44a4-9d98-7aa85b615797","fe_id_bef41005-f919-4ed8-8643-07a93fcbf55b","fe_id_bd26ce55-265b-4511-abbe-a086059e363c","fe_id_68dcc4f3-b203-470d-a927-ab983c3a7458","fe_id_507c9850-23cf-469d-bfe2-25e93d976347","fe_id_4eef7741-510a-4254-b14d-9c4b93175730","fe_id_ad790b33-a7e4-4bab-860a-5b7dbf2f4ae9","fe_id_22a94922-3bd3-498b-942c-fdf157e91d71","fe_id_0d068591-8f4f-46d6-a2ec-47cbf9384f4b","fe_id_145f5c99-1778-4439-8140-56ec14e376fb"]
+[00:04:28 #30] labsfx 已定位发送按钮 {"text":"arrow_forward创建"}
+[00:04:28 #31] labsfx 已触发发送按钮点击
+[00:04:28 #32] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:28 #33] labsfx 已捕获项目 ID {"projectId":"b6a45854-7296-4984-a0de-930eb31d25ae"}
+[00:04:33 #34] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:36 #35] labsfx 任务执行失败，准备回传错误 {"id":"img_1775491446_21","error":"labs.google/fx video generate request was not patched with reference images"}
+[00:04:36 #36] labsfx worker 异常 labs.google/fx video generate request was not patched with reference images
+[00:04:42 #37] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:47 #38] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:51 #39] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:57 #40] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:04:58 #41] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}
+[00:05:09 #42] labsfx 已捕获页面 API 认证头 {"keys":["authorization"],"authPrefix":"Bearer ya29.a0Aa7MYipSwP"}

@@ -448,6 +448,200 @@ const siteAdapters: SiteAdapter[] = [
     },
   },
   {
+    id: 'claude',
+    matches: () => location.hostname === 'claude.ai' || location.hostname.endsWith('.claude.ai'),
+    config: {
+      editor: 'div[contenteditable="true"][data-slate-editor="true"], div[contenteditable="true"][role="textbox"], div.ProseMirror[contenteditable="true"], textarea',
+      sendBtn: 'button[aria-label*="Send"], button[aria-label*="发送"], button[data-testid*="send"], button[type="submit"]',
+      stopBtn: 'button[aria-label*="Stop"], button[aria-label*="停止"]',
+      fillMethod: 'execCommand',
+      useObserver: true,
+      responseSelector: 'article, [data-testid*="assistant"], div.font-claude-message, div[class*="markdown"], div.prose',
+    },
+    getConversationId() {
+      const m = location.pathname.match(/\/chat\/([^/?#]+)/);
+      return m ? m[1] : defaultConversationId();
+    },
+    getSourceKey(sourceEl) {
+      const message = sourceEl?.closest('article, [data-testid*="message"], [data-testid*="assistant"]');
+      const id = message?.getAttribute('data-testid') || message?.getAttribute('id');
+      if (id) return id;
+      return defaultSourceKey(sourceEl);
+    },
+    isAssistantResponse(el) {
+      if (!el) return false;
+      if (el.closest('form, [contenteditable="true"], textarea')) return false;
+      const message = el.closest('article, [data-testid*="assistant"], [data-testid*="message"]');
+      if (!message) return false;
+      return !message.querySelector('textarea, [contenteditable="true"]');
+    },
+    shouldRenderToolText(text, sourceEl) {
+      if (sourceEl?.closest('pre, code')) return false;
+      return text.replace(/\s+/g, ' ').includes('<tool');
+    },
+    getToolCardMount(sourceEl) {
+      const message = sourceEl.closest('article, [data-testid*="assistant"], [data-testid*="message"]');
+      if (message) return { anchor: message, before: message.lastElementChild };
+      return defaultToolMount(sourceEl);
+    },
+    getEditorRegion(editor) {
+      if (!editor) return null;
+      return editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor);
+    },
+    getSendButton(editor, sendBtnSel) {
+      const region = (editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor)) as Element | null;
+      if (region) {
+        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
+          const btn = region.querySelector<HTMLElement>(sel);
+          if (btn && isVisibleElement(btn) && !(btn as HTMLButtonElement).disabled && btn.getAttribute('aria-disabled') !== 'true') return btn;
+        }
+      }
+      const globalBtn = querySelectorFirst(sendBtnSel);
+      return globalBtn && isVisibleElement(globalBtn) && !(globalBtn as HTMLButtonElement).disabled ? globalBtn : null;
+    },
+  },
+  {
+    id: 'kimi',
+    matches: () => location.hostname === 'www.kimi.com' || location.hostname.endsWith('.kimi.com') || location.hostname.endsWith('.moonshot.cn'),
+    config: {
+      editor: '.chat-input-editor[contenteditable="true"], div[contenteditable="true"][data-lexical-editor="true"], div[contenteditable="true"][role="textbox"]',
+      sendBtn: '.send-button, button[aria-label*="Send"], button[aria-label*="发送"], button[type="submit"]',
+      stopBtn: null,
+      fillMethod: 'execCommand',
+      useObserver: true,
+      responseSelector: '.markdown, [class*="markdown"], [data-message-id] [class*="segment"], [data-message-id] [class*="text"]',
+    },
+    getConversationId: defaultConversationId,
+    getSourceKey(sourceEl) {
+      const message = sourceEl?.closest('[data-message-id]');
+      const id = message?.getAttribute('data-message-id');
+      if (id) return id;
+      return defaultSourceKey(sourceEl);
+    },
+    isAssistantResponse(el) {
+      if (!el) return false;
+      if (el.closest('[contenteditable="true"]')) return false;
+      const message = el.closest('[data-message-id]');
+      return !!message && !message.querySelector('[contenteditable="true"]');
+    },
+    shouldRenderToolText(text, sourceEl) {
+      if (sourceEl?.closest('pre, code')) return false;
+      return text.replace(/\s+/g, ' ').includes('<tool');
+    },
+    getToolCardMount(sourceEl) {
+      const message = sourceEl.closest('[data-message-id]');
+      if (message) return { anchor: message, before: message.lastElementChild };
+      return defaultToolMount(sourceEl);
+    },
+    getEditorRegion(editor) {
+      if (!editor) return null;
+      return editor.closest('form') ?? editor.closest('[class*="input"]') ?? defaultEditorRegion(editor);
+    },
+    getSendButton(editor, sendBtnSel) {
+      const region = (editor.closest('form') ?? editor.closest('[class*="input"]') ?? defaultEditorRegion(editor)) as Element | null;
+      if (region) {
+        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
+          const btn = region.querySelector<HTMLElement>(sel);
+          if (btn && isVisibleElement(btn) && btn.getAttribute('aria-disabled') !== 'true') return btn;
+        }
+      }
+      return querySelectorFirst(sendBtnSel);
+    },
+  },
+  {
+    id: 'perplexity',
+    matches: () => location.hostname === 'www.perplexity.ai' || location.hostname === 'perplexity.ai',
+    config: {
+      editor: '#ask-input[contenteditable="true"], div[contenteditable="true"][data-lexical-editor="true"], textarea',
+      sendBtn: 'button[aria-label="Submit"], button[aria-label="Send"], button[type="submit"]',
+      stopBtn: 'button[aria-label*="Stop"], button[aria-label*="停止"]',
+      fillMethod: 'execCommand',
+      useObserver: true,
+      responseSelector: 'main .prose, article .prose, [class*="prose"]',
+    },
+    getConversationId: defaultConversationId,
+    getSourceKey(sourceEl) {
+      const article = sourceEl?.closest('article');
+      if (article?.id) return article.id;
+      return defaultSourceKey(sourceEl);
+    },
+    isAssistantResponse(el) {
+      if (!el) return false;
+      if (el.closest('form, [contenteditable="true"], textarea')) return false;
+      return !!el.closest('article, main');
+    },
+    shouldRenderToolText(text, sourceEl) {
+      if (sourceEl?.closest('pre, code')) return false;
+      return text.replace(/\s+/g, ' ').includes('<tool');
+    },
+    getToolCardMount(sourceEl) {
+      const article = sourceEl.closest('article');
+      if (article) return { anchor: article, before: article.lastElementChild };
+      return defaultToolMount(sourceEl);
+    },
+    getEditorRegion(editor) {
+      if (!editor) return null;
+      return editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor);
+    },
+    getSendButton(editor, sendBtnSel) {
+      const region = (editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor)) as Element | null;
+      if (region) {
+        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
+          const btn = region.querySelector<HTMLElement>(sel);
+          if (btn && isVisibleElement(btn) && btn.getAttribute('aria-disabled') !== 'true') return btn;
+        }
+      }
+      return querySelectorFirst(sendBtnSel);
+    },
+  },
+  {
+    id: 'glm-intl',
+    matches: () => location.hostname === 'chat.z.ai' || location.hostname.endsWith('.z.ai'),
+    config: {
+      editor: '#chat-input, textarea, div[contenteditable="true"][role="textbox"]',
+      sendBtn: '#send-message-button, button[type="submit"], button[aria-label*="Send"]',
+      stopBtn: null,
+      fillMethod: 'value',
+      useObserver: true,
+      responseSelector: 'article, [class*="markdown"], [data-testid*="assistant"], .prose',
+    },
+    getConversationId: defaultConversationId,
+    getSourceKey(sourceEl) {
+      const article = sourceEl?.closest('article, [data-testid*="assistant"], [data-testid*="message"]');
+      const id = article?.getAttribute('data-testid') || article?.getAttribute('id');
+      if (id) return id;
+      return defaultSourceKey(sourceEl);
+    },
+    isAssistantResponse(el) {
+      if (!el) return false;
+      if (el.closest('form, textarea, [contenteditable="true"]')) return false;
+      return !!el.closest('article, [data-testid*="assistant"], [data-testid*="message"]');
+    },
+    shouldRenderToolText(text, sourceEl) {
+      if (sourceEl?.closest('pre, code')) return false;
+      return text.replace(/\s+/g, ' ').includes('<tool');
+    },
+    getToolCardMount(sourceEl) {
+      const article = sourceEl.closest('article, [data-testid*="assistant"], [data-testid*="message"]');
+      if (article) return { anchor: article, before: article.lastElementChild };
+      return defaultToolMount(sourceEl);
+    },
+    getEditorRegion(editor) {
+      if (!editor) return null;
+      return editor.closest('form') ?? editor.closest('[class*="input"]') ?? defaultEditorRegion(editor);
+    },
+    getSendButton(editor, sendBtnSel) {
+      const region = (editor.closest('form') ?? editor.closest('[class*="input"]') ?? defaultEditorRegion(editor)) as Element | null;
+      if (region) {
+        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
+          const btn = region.querySelector<HTMLElement>(sel);
+          if (btn && isVisibleElement(btn) && btn.getAttribute('aria-disabled') !== 'true') return btn;
+        }
+      }
+      return querySelectorFirst(sendBtnSel);
+    },
+  },
+  {
     id: 'default',
     matches: () => true,
     config: {
@@ -1775,7 +1969,7 @@ async function fetchQwenImageWithRetry(imageURL: string): Promise<{ bodyBase64: 
   throw new Error(`qwen image fetch failed: ${lastError}`);
 }
 
-const browserTextWorkerSites = new Set(['gemini', 'chatgpt', 'qwen', 'deepseek', 'doubao']);
+const browserTextWorkerSites = new Set(['gemini', 'chatgpt', 'claude', 'kimi', 'perplexity', 'glm-intl', 'qwen', 'deepseek', 'doubao']);
 const browserTextWorkerStarted = new Set<string>();
 
 function getBrowserTextWorkerSiteID(): string | null {
@@ -1800,6 +1994,7 @@ function startBrowserTextWorker(siteID: string) {
         return;
       }
       const headers: Record<string, string> = { Authorization: `Bearer ${authToken}` };
+      debugLog('text worker 开始轮询任务', { siteID, apiUrl, hasAuthToken: !!authToken });
       const resp = await bgFetch(`${apiUrl}/bridge/text-jobs/next?site_id=${encodeURIComponent(siteID)}`, { headers });
       if (!resp.ok) {
         debugLog('text worker 拉取任务失败', { siteID, status: resp.status });
@@ -1807,7 +2002,10 @@ function startBrowserTextWorker(siteID: string) {
       }
       const payload = JSON.parse(resp.body || '{}');
       const job = payload.job;
-      if (!job?.id || !job?.prompt) return;
+      if (!job?.id || !job?.prompt) {
+        debugLog('text worker 当前无可执行任务', { siteID });
+        return;
+      }
       debugLog('text worker 收到任务', { siteID, id: job.id, model: job.model || '', prompt: String(job.prompt).slice(0, 120) });
       try {
         await runBrowserTextJob(job, apiUrl, authToken);
@@ -1851,13 +2049,14 @@ async function runBrowserTextJob(job: any, apiUrl: string, authToken: string) {
   const adapter = getSiteAdapter();
   const prompt = String(job.prompt || '');
   showToast(`开始文本任务: ${job.id}`, 2500);
-  debugLog('text job 开始执行', { id: job.id, siteID: adapter.id, model: job.model || '' });
+  debugLog('text job 开始执行', { id: job.id, siteID: adapter.id, model: job.model || '', promptLength: prompt.length, messageCount: Array.isArray(job.messages) ? job.messages.length : 0, href: location.href });
 
   const beforeCandidates = getBrowserTextResponseCandidates();
   const beforeKeys = new Set(beforeCandidates.map(getBrowserTextResponseNodeKey));
   debugLog('text job 提交前响应集合', { count: beforeCandidates.length, keys: Array.from(beforeKeys).slice(-8) });
 
   const editor = await waitForCurrentEditor(adapter.config.editor, 20000);
+  debugLog('text job 已定位输入框', { id: job.id, tag: editor.tagName, selector: adapter.config.editor, contenteditable: editor.getAttribute('contenteditable') || '', role: editor.getAttribute('role') || '' });
   await setBrowserTextPrompt(editor, prompt);
   debugLog('text job Prompt 已写入', { id: job.id, editorText: getEditorText(editor).slice(0, 120) });
 
@@ -1885,6 +2084,7 @@ async function runBrowserTextJob(job: any, apiUrl: string, authToken: string) {
     }),
   });
   if (!resultResp.ok) throw new Error(`text result upload failed: HTTP ${resultResp.status}`);
+  debugLog('text job 结果已回传', { id: job.id, status: resultResp.status, key: response.key, length: response.text.length });
   showToast(`文本任务已完成: ${job.id}`, 2500);
 }
 
@@ -2001,8 +2201,20 @@ async function waitForBrowserTextResponse(beforeKeys: Set<string>, prompt: strin
   const deadline = Date.now() + timeoutMs;
   let candidate: HTMLElement | null = null;
   let candidateKey = '';
+  let pollCount = 0;
+  let lastSummary = '';
   while (Date.now() < deadline) {
+    pollCount += 1;
     const candidates = getBrowserTextResponseCandidates();
+    const summary = JSON.stringify({
+      pollCount,
+      candidateCount: candidates.length,
+      latestKeys: candidates.slice(-3).map((el) => getBrowserTextResponseNodeKey(el)),
+    });
+    if (summary !== lastSummary && (pollCount <= 5 || pollCount % 10 === 0)) {
+      lastSummary = summary;
+      debugLog('text job 响应轮询状态', JSON.parse(summary));
+    }
     for (let i = candidates.length - 1; i >= 0; i--) {
       const el = candidates[i];
       const key = getBrowserTextResponseNodeKey(el);
@@ -2010,6 +2222,7 @@ async function waitForBrowserTextResponse(beforeKeys: Set<string>, prompt: strin
       if (!beforeKeys.has(key) && isLikelyBrowserTextOutput(text, prompt)) {
         candidate = el;
         candidateKey = key;
+        debugLog('text job 捕获到候选响应', { key, length: text.length, preview: text.slice(0, 160) });
         break;
       }
     }
@@ -2019,6 +2232,7 @@ async function waitForBrowserTextResponse(beforeKeys: Set<string>, prompt: strin
     }
     await sleep(500);
   }
+  debugLog('text job 等待响应超时', { timeoutMs, beforeCount: beforeKeys.size, promptPreview: prompt.slice(0, 120) });
   throw new Error('wait for browser text response timed out');
 }
 
@@ -2026,11 +2240,19 @@ async function waitForBrowserTextStability(el: HTMLElement, prompt: string, quie
   const deadline = Date.now() + timeoutMs;
   let lastText = '';
   let stableSince = 0;
+  let lastLoggedText = '';
   while (Date.now() < deadline) {
     const text = getBrowserTextResponseText(el);
+    if (text !== lastLoggedText) {
+      lastLoggedText = text;
+      debugLog('text job 响应内容更新', { length: text.length, preview: text.slice(0, 160) });
+    }
     if (isLikelyBrowserTextOutput(text, prompt) && text === lastText) {
       if (!stableSince) stableSince = Date.now();
-      if (Date.now() - stableSince >= quietMs) return text;
+      if (Date.now() - stableSince >= quietMs) {
+        debugLog('text job 响应已稳定', { quietMs, length: text.length, preview: text.slice(0, 160) });
+        return text;
+      }
     } else {
       lastText = text;
       stableSince = 0;
@@ -2038,6 +2260,7 @@ async function waitForBrowserTextStability(el: HTMLElement, prompt: string, quie
     await sleep(500);
   }
   if (isLikelyBrowserTextOutput(lastText, prompt)) return lastText;
+  debugLog('text job 响应未稳定', { timeoutMs, lastLength: lastText.length, preview: lastText.slice(0, 160) });
   throw new Error('browser text response did not stabilize');
 }
 

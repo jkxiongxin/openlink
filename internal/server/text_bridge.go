@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,24 +61,32 @@ func (b *textJobBridge) enqueue(siteID, prompt, model string, messages []textJob
 	b.mu.Lock()
 	b.pending = append(b.pending, job)
 	b.waiters[job.ID] = ch
+	pendingCount := len(b.pending)
+	inflightCount := len(b.inflight)
 	b.mu.Unlock()
+	log.Printf("[OpenLink][TextBridge] enqueue job=%s site=%s model=%s prompt_len=%d messages=%d pending=%d inflight=%d", job.ID, job.SiteID, job.Model, len(strings.TrimSpace(job.Prompt)), len(job.Messages), pendingCount, inflightCount)
 	return job, ch
 }
 
 func (b *textJobBridge) enqueueAndWait(ctx context.Context, siteID, prompt, model string, messages []textJobMessage) (*textJob, *textJobResult, error) {
 	job, ch := b.enqueue(siteID, prompt, model, messages)
+	start := time.Now()
 
 	select {
 	case result := <-ch:
 		if result == nil {
+			log.Printf("[OpenLink][TextBridge] wait ended with nil result job=%s site=%s model=%s duration=%s", job.ID, job.SiteID, job.Model, time.Since(start).Round(time.Millisecond))
 			return nil, nil, errors.New("text job failed")
 		}
 		if strings.TrimSpace(result.Error) != "" {
+			log.Printf("[OpenLink][TextBridge] wait ended with error job=%s site=%s model=%s duration=%s error=%q metadata=%v", job.ID, job.SiteID, job.Model, time.Since(start).Round(time.Millisecond), result.Error, result.Metadata)
 			return nil, nil, errors.New(result.Error)
 		}
+		log.Printf("[OpenLink][TextBridge] wait completed job=%s site=%s model=%s duration=%s content_len=%d metadata=%v", job.ID, job.SiteID, job.Model, time.Since(start).Round(time.Millisecond), len(result.Content), result.Metadata)
 		return job, result, nil
 	case <-ctx.Done():
 		b.remove(job.ID)
+		log.Printf("[OpenLink][TextBridge] wait timed out/cancelled job=%s site=%s model=%s duration=%s err=%v", job.ID, job.SiteID, job.Model, time.Since(start).Round(time.Millisecond), ctx.Err())
 		return nil, nil, ctx.Err()
 	}
 }
@@ -91,6 +100,7 @@ func (b *textJobBridge) nextJob(siteID string) *textJob {
 		}
 		b.pending = append(b.pending[:i], b.pending[i+1:]...)
 		b.inflight[job.ID] = job
+		log.Printf("[OpenLink][TextBridge] dispatch job=%s requested_site=%s job_site=%s model=%s age=%s pending=%d inflight=%d", job.ID, strings.TrimSpace(siteID), job.SiteID, job.Model, time.Since(job.CreatedAt).Round(time.Millisecond), len(b.pending), len(b.inflight))
 		return job
 	}
 	return nil
@@ -112,9 +122,11 @@ func (b *textJobBridge) complete(jobID, content string, metadata map[string]stri
 	b.mu.Unlock()
 
 	if !ok || waiter == nil {
+		log.Printf("[OpenLink][TextBridge] complete rejected job=%s ok=%v waiter=%v", jobID, ok, waiter != nil)
 		return nil, errors.New("text job not found")
 	}
 	result := &textJobResult{Content: content, Metadata: cloneTextMetadata(metadata)}
+	log.Printf("[OpenLink][TextBridge] complete job=%s content_len=%d metadata=%v", jobID, len(content), metadata)
 	waiter <- result
 	close(waiter)
 	return result, nil
@@ -130,6 +142,7 @@ func (b *textJobBridge) failWithError(jobID, message string) {
 	delete(b.waiters, jobID)
 	delete(b.inflight, jobID)
 	b.mu.Unlock()
+	log.Printf("[OpenLink][TextBridge] fail job=%s error=%q waiter=%v", jobID, strings.TrimSpace(message), waiter != nil)
 	if waiter != nil {
 		waiter <- &textJobResult{Error: strings.TrimSpace(message)}
 		close(waiter)
@@ -144,9 +157,11 @@ func (b *textJobBridge) remove(jobID string) {
 	for i, pending := range b.pending {
 		if pending.ID == jobID {
 			b.pending = append(b.pending[:i], b.pending[i+1:]...)
+			log.Printf("[OpenLink][TextBridge] remove pending job=%s remaining_pending=%d inflight=%d", jobID, len(b.pending), len(b.inflight))
 			return
 		}
 	}
+	log.Printf("[OpenLink][TextBridge] remove job=%s not found in pending inflight=%d", jobID, len(b.inflight))
 }
 
 func cloneTextJobMessages(messages []textJobMessage) []textJobMessage {

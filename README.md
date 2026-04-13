@@ -81,9 +81,13 @@ openlink
 | Google Gemini | ✅ | |
 | LMArena / Arena (`arena.ai`) | ✅ | 支持 `/text/direct` 和进入对话后的 `/c/...` 页面 |
 | ChatGPT (`chatgpt.com`) | ✅ | 支持工具卡片、图片任务和 Phase 1 浏览器文本接口 |
+| Claude (`claude.ai`) | ✅ | 新增 Phase 1 浏览器文本接口，建议先开 `debugMode` 验证选择器 |
 | DeepSeek (`chat.deepseek.com`) | ✅ | 支持工具卡片和 Phase 1 浏览器文本接口 |
+| Kimi (`kimi.com` / `moonshot.cn`) | ✅ | 新增 Phase 1 浏览器文本接口，建议先开 `debugMode` 验证选择器 |
+| Perplexity (`perplexity.ai`) | ✅ | 新增 Phase 1 浏览器文本接口，建议先开 `debugMode` 验证选择器 |
 | 通义千问 / Qwen (`chat.qwen.ai`) | ✅ | 支持工具卡片、图片任务和 Phase 1 浏览器文本接口 |
 | 豆包 / Doubao (`doubao.com`) | ✅ | 支持工具卡片和 Phase 1 浏览器文本接口 |
+| z.ai / GLM International (`chat.z.ai`) | ✅ | 新增 Phase 1 浏览器文本接口，建议先开 `debugMode` 验证选择器 |
 | Google Labs Flow (`labs.google/fx`) | ✅ | 支持图片 / 视频生成；通过 OpenAI 兼容接口调用；无需初始化 |
 
 > LMArena / Arena 目前通过对话消息注入提示词工作，兼容性和工具调用稳定性仍依赖具体模型与页面结构。
@@ -105,6 +109,10 @@ Phase 1 文本模型：
 |---------|------|
 | `gemini-web/gemini-2.5-pro` | Gemini |
 | `chatgpt-web/gpt-4o` | ChatGPT |
+| `claude-web/claude-sonnet-4-6` | Claude |
+| `kimi-web/moonshot-v1-32k` | Kimi |
+| `perplexity-web/perplexity-web` | Perplexity |
+| `glm-intl-web/glm-4-plus` | z.ai / GLM International |
 | `qwen-web/qwen-plus` | Qwen |
 | `deepseek-web/deepseek-chat` | DeepSeek |
 | `doubao-web/doubao-seed-2.0` | Doubao |
@@ -132,6 +140,7 @@ curl http://127.0.0.1:39527/v1/chat/completions \
 - 文本接口 Phase 1 只支持非流式响应；`stream: true` 会返回明确的暂不支持错误。
 - 文本任务使用最近一条用户消息作为主要提示词；图片引用的文本多模态输入还没有在所有文本网站上做完整适配。
 - 网页 DOM 变化可能影响提交按钮和回答提取，调试新站点时请先打开扩展的 `debugMode`。
+- 新增的 Claude / Kimi / Perplexity / z.ai 站点采用 DOM 选择器方式接入，第一次使用时建议在真实登录页面上做一次端到端冒烟验证。
 
 ## Flow 使用说明
 
