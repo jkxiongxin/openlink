@@ -88,6 +88,27 @@ export default function App() {
     chrome.storage.local.set({ debugMode: val })
   }
 
+  const handleProbeTextWorker = async () => {
+    setInfo('正在检测当前标签页 text worker...')
+    try {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
+      const tab = tabs[0]
+      if (!tab?.id) {
+        setInfo('未找到当前活动标签页')
+        return
+      }
+      const response = await chrome.tabs.sendMessage(tab.id, { type: 'OPENLINK_TEXT_WORKER_PROBE' })
+      if (response?.ok) {
+        setInfo(`worker 已注册: ${response.adapterId || 'unknown'} / ${response.workerId || ''}`)
+      } else {
+        setInfo(`worker 注册失败: ${response?.error || 'unknown error'}`)
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setInfo(`当前页未响应 content script: ${message}`)
+    }
+  }
+
   const statusColor = status === 'connected' ? 'bg-emerald-400' : status === 'checking' ? 'bg-yellow-400' : 'bg-red-400'
   const statusText = status === 'checking' ? '检查中...' : status === 'connected' ? '已连接' : '未连接'
 
@@ -165,6 +186,14 @@ export default function App() {
             <span className={`inline-block w-5 h-5 mt-0.5 bg-white rounded-full shadow transition-transform duration-200 ${debugMode ? 'translate-x-5' : 'translate-x-0.5'}`} />
           </button>
         </div>
+
+        <button
+          onClick={handleProbeTextWorker}
+          disabled={status !== 'connected'}
+          className="w-full bg-gray-800 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed text-gray-100 text-sm rounded-lg py-2 transition-colors cursor-pointer"
+        >
+          检测当前页 text worker
+        </button>
 
         {autoSend && (
           <div className="bg-gray-900 rounded-lg p-3 space-y-2">

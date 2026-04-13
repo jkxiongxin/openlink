@@ -505,7 +505,7 @@ const siteAdapters: SiteAdapter[] = [
     matches: () => location.hostname === 'www.kimi.com' || location.hostname.endsWith('.kimi.com') || location.hostname.endsWith('.moonshot.cn'),
     config: {
       editor: '.chat-input-editor[contenteditable="true"], div[contenteditable="true"][data-lexical-editor="true"], div[contenteditable="true"][role="textbox"]',
-      sendBtn: '.send-button, button[aria-label*="Send"], button[aria-label*="发送"], button[type="submit"]',
+      sendBtn: '.send-button-container, .send-button, button[aria-label*="Send"], button[aria-label*="发送"], button[type="submit"]',
       stopBtn: null,
       fillMethod: 'execCommand',
       useObserver: true,
@@ -521,6 +521,8 @@ const siteAdapters: SiteAdapter[] = [
     isAssistantResponse(el) {
       if (!el) return false;
       if (el.closest('[contenteditable="true"]')) return false;
+      const kimiAssistant = el.closest('.segment-assistant, .chat-content-item-assistant');
+      if (kimiAssistant) return !kimiAssistant.querySelector('[contenteditable="true"]');
       const message = el.closest('[data-message-id]');
       return !!message && !message.querySelector('[contenteditable="true"]');
     },
@@ -535,12 +537,13 @@ const siteAdapters: SiteAdapter[] = [
     },
     getEditorRegion(editor) {
       if (!editor) return null;
-      return editor.closest('form') ?? editor.closest('[class*="input"]') ?? defaultEditorRegion(editor);
+      return editor.closest('form') ?? editor.closest('.chat-editor') ?? editor.closest('.chat-input') ?? defaultEditorRegion(editor);
     },
     getSendButton(editor, sendBtnSel) {
-      const region = (editor.closest('form') ?? editor.closest('[class*="input"]') ?? defaultEditorRegion(editor)) as Element | null;
+      const region = (editor.closest('form') ?? editor.closest('.chat-editor') ?? editor.closest('.chat-input') ?? defaultEditorRegion(editor)) as Element | null;
       if (region) {
-        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
+        const selectors = ['.send-button-container', ...sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)];
+        for (const sel of selectors) {
           const btn = region.querySelector<HTMLElement>(sel);
           if (btn && isVisibleElement(btn) && btn.getAttribute('aria-disabled') !== 'true') return btn;
         }
@@ -696,6 +699,12 @@ let geminiMediaSeq = 0;
 let geminiReferenceAttachSeq = 0;
 let extensionContextInvalidated = false;
 let extensionContextInvalidatedLogged = false;
+const browserTextWorkerID = getOrCreateBrowserTextWorkerID();
+const browserTextWorkerSites = new Set(['gemini', 'chatgpt', 'claude', 'kimi', 'perplexity', 'glm-intl', 'qwen', 'deepseek', 'doubao']);
+const browserTextWorkerStarted = new Set<string>();
+let manualBrowserTextEndSeq = 0;
+
+type BrowserTextChunkReporter = (content: string, metadata: Record<string, string>) => Promise<void>;
 
 function formatDebugValue(value: unknown): string {
   if (value == null) return '';
@@ -716,6 +725,79 @@ function debugLog(message: string, data?: unknown) {
   debugLogs.push(line);
   if (debugLogs.length > DEBUG_LOG_LIMIT) debugLogs.splice(0, debugLogs.length - DEBUG_LOG_LIMIT);
   if (debugModeEnabled) refreshDebugLogView();
+}
+
+function getOrCreateBrowserTextWorkerID(): string {
+  const key = 'openlink_browser_text_worker_id';
+  try {
+    const existing = sessionStorage.getItem(key);
+    if (existing) return existing;
+    const generated = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `worker_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    sessionStorage.setItem(key, generated);
+    return generated;
+  } catch {
+    return `worker_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  }
+}
+
+function buildBrowserTextBridgeURL(apiUrl: string, path: string, siteID: string, idle: boolean, busyJobID = ''): string {
+  const params = new URLSearchParams({
+    site_id: siteID,
+    worker_id: browserTextWorkerID,
+    conversation_id: getConversationId(),
+    page_url: location.href,
+    page_title: document.title || '',
+    visibility: document.visibilityState || '',
+    focused: String(document.hasFocus()),
+    idle: String(idle),
+  });
+  if (busyJobID) params.set('busy_job_id', busyJobID);
+  return `${apiUrl}${path}?${params.toString()}`;
+}
+
+function buildBrowserTextJobNextURL(apiUrl: string, siteID: string, idle: boolean, busyJobID = ''): string {
+  return buildBrowserTextBridgeURL(apiUrl, '/bridge/text-jobs/next', siteID, idle, busyJobID);
+}
+
+function buildBrowserTextWorkerRegisterURL(apiUrl: string, siteID: string, idle: boolean, busyJobID = ''): string {
+  return buildBrowserTextBridgeURL(apiUrl, '/bridge/text-workers/register', siteID, idle, busyJobID);
+}
+
+async function registerBrowserTextWorker(trigger: string): Promise<Record<string, unknown>> {
+  const siteID = getBrowserTextWorkerSiteID();
+  if (!siteID) throw new Error(`current adapter is not a browser text worker: ${getSiteAdapter().id}`);
+  const { authToken, apiUrl } = await getStoredConfig(['authToken', 'apiUrl']);
+  if (!authToken || !apiUrl) throw new Error(`missing config: authToken=${!!authToken} apiUrl=${!!apiUrl}`);
+  const headers: Record<string, string> = { Authorization: `Bearer ${authToken}` };
+  const url = buildBrowserTextWorkerRegisterURL(apiUrl, siteID, true);
+  debugLog('手动注册 text worker', {
+    trigger,
+    siteID,
+    workerID: browserTextWorkerID,
+    href: location.href,
+    visibility: document.visibilityState,
+    focused: document.hasFocus(),
+  });
+  const resp = await bgFetch(url, { headers });
+  let payload: Record<string, unknown> = {};
+  try { payload = JSON.parse(resp.body || '{}'); } catch {}
+  debugLog('手动注册 text worker 结果', { trigger, status: resp.status, ok: resp.ok, payload });
+  if (!resp.ok) throw new Error(`register failed: HTTP ${resp.status} ${resp.body.slice(0, 200)}`);
+  return payload;
+}
+
+function markBrowserTextResponseEnded(trigger: string) {
+  manualBrowserTextEndSeq += 1;
+  const adapter = getSiteAdapter();
+  debugLog('手动标记 AI 响应结束', {
+    trigger,
+    seq: manualBrowserTextEndSeq,
+    adapter: adapter.id,
+    deepseek: adapter.id === 'deepseek' ? getDeepSeekLatestResponseState() : null,
+  });
+  showToast('已标记 AI 响应结束', 2500);
 }
 
 if (!(window as any).__OPENLINK_LOADED__) {
@@ -812,6 +894,26 @@ if (!(window as any).__OPENLINK_LOADED__) {
     }
   });
 
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type !== 'OPENLINK_TEXT_WORKER_PROBE') return false;
+    registerBrowserTextWorker('popup')
+      .then((payload) => sendResponse({
+        ok: true,
+        adapterId: adapter.id,
+        workerId: browserTextWorkerID,
+        href: location.href,
+        payload,
+      }))
+      .catch((error) => sendResponse({
+        ok: false,
+        adapterId: adapter.id,
+        workerId: browserTextWorkerID,
+        href: location.href,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    return true;
+  });
+
   const mountDebugUi = () => {
     injectInitButton();
     debugModeEnabled = debugMode;
@@ -855,9 +957,41 @@ if (!(window as any).__OPENLINK_LOADED__) {
 
   const textWorkerSiteID = getBrowserTextWorkerSiteID();
   if (textWorkerSiteID) {
-    const start = () => startBrowserTextWorker(textWorkerSiteID);
-    if (document.body) start();
-    else document.addEventListener('DOMContentLoaded', start);
+    startWhenBodyReady('browser text worker', () => startBrowserTextWorker(textWorkerSiteID));
+  }
+}
+
+function startWhenBodyReady(name: string, start: () => void) {
+  let started = false;
+  const tryStart = (source: string) => {
+    if (started) return;
+    if (!document.body) {
+      debugLog(`${name} 等待 document.body`, { source, readyState: document.readyState });
+      return;
+    }
+    started = true;
+    debugLog(`${name} 准备启动`, { source, readyState: document.readyState });
+    start();
+  };
+
+  tryStart('initial');
+  if (!started) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => tryStart('DOMContentLoaded'), { once: true });
+    } else {
+      setTimeout(() => tryStart('setTimeout'), 0);
+    }
+    window.addEventListener('load', () => tryStart('load'), { once: true });
+    const intervalId = window.setInterval(() => {
+      tryStart('interval');
+      if (started) window.clearInterval(intervalId);
+    }, 500);
+    window.setTimeout(() => {
+      if (!started) {
+        window.clearInterval(intervalId);
+        debugLog(`${name} 启动超时`, { readyState: document.readyState, hasBody: !!document.body });
+      }
+    }, 10000);
   }
 }
 
@@ -1295,6 +1429,23 @@ function injectDebugPanel() {
         refreshDebugLogView();
         showToast('已清空调试日志', 2000);
       },
+    },
+    {
+      label: '手动注册文本 worker',
+      onClick: async () => {
+        try {
+          const payload = await registerBrowserTextWorker('debug-panel');
+          showToast(`文本 worker 已注册: ${JSON.stringify(payload).slice(0, 120)}`, 3500);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          debugLog('手动注册文本 worker 失败', { error: message });
+          showToast(`注册失败: ${message}`, 5000);
+        }
+      },
+    },
+    {
+      label: '标记 AI 响应结束',
+      onClick: () => markBrowserTextResponseEnded('debug-panel'),
     },
   ];
 
@@ -1969,9 +2120,6 @@ async function fetchQwenImageWithRetry(imageURL: string): Promise<{ bodyBase64: 
   throw new Error(`qwen image fetch failed: ${lastError}`);
 }
 
-const browserTextWorkerSites = new Set(['gemini', 'chatgpt', 'claude', 'kimi', 'perplexity', 'glm-intl', 'qwen', 'deepseek', 'doubao']);
-const browserTextWorkerStarted = new Set<string>();
-
 function getBrowserTextWorkerSiteID(): string | null {
   const siteID = getSiteAdapter().id;
   return browserTextWorkerSites.has(siteID) ? siteID : null;
@@ -1994,19 +2142,22 @@ function startBrowserTextWorker(siteID: string) {
         return;
       }
       const headers: Record<string, string> = { Authorization: `Bearer ${authToken}` };
-      debugLog('text worker 开始轮询任务', { siteID, apiUrl, hasAuthToken: !!authToken });
-      const resp = await bgFetch(`${apiUrl}/bridge/text-jobs/next?site_id=${encodeURIComponent(siteID)}`, { headers });
+      const pollUrl = buildBrowserTextJobNextURL(apiUrl, siteID, true);
+      const resp = await bgFetch(pollUrl, { headers });
       if (!resp.ok) {
         debugLog('text worker 拉取任务失败', { siteID, status: resp.status });
         return;
       }
       const payload = JSON.parse(resp.body || '{}');
       const job = payload.job;
-      if (!job?.id || !job?.prompt) {
-        debugLog('text worker 当前无可执行任务', { siteID });
-        return;
-      }
-      debugLog('text worker 收到任务', { siteID, id: job.id, model: job.model || '', prompt: String(job.prompt).slice(0, 120) });
+      if (!job?.id || !job?.prompt) return;
+      debugLog('text worker 收到任务', {
+        siteID,
+        workerID: browserTextWorkerID,
+        id: job.id,
+        model: job.model || '',
+        prompt: String(job.prompt).slice(0, 120),
+      });
       try {
         await runBrowserTextJob(job, apiUrl, authToken);
       } catch (err) {
@@ -2018,7 +2169,16 @@ function startBrowserTextWorker(siteID: string) {
             Authorization: `Bearer ${authToken}`,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ error: message }),
+          body: JSON.stringify({
+            error: message,
+            metadata: {
+              site_id: siteID,
+              worker_id: browserTextWorkerID,
+              conversation_id: getConversationId(),
+              page_url: location.href,
+              page_title: document.title || '',
+            },
+          }),
         });
         throw err;
       }
@@ -2049,7 +2209,7 @@ async function runBrowserTextJob(job: any, apiUrl: string, authToken: string) {
   const adapter = getSiteAdapter();
   const prompt = String(job.prompt || '');
   showToast(`开始文本任务: ${job.id}`, 2500);
-  debugLog('text job 开始执行', { id: job.id, siteID: adapter.id, model: job.model || '', promptLength: prompt.length, messageCount: Array.isArray(job.messages) ? job.messages.length : 0, href: location.href });
+  debugLog('text job 开始执行', { id: job.id, siteID: adapter.id, workerID: browserTextWorkerID, model: job.model || '', promptLength: prompt.length, messageCount: Array.isArray(job.messages) ? job.messages.length : 0, href: location.href });
 
   const beforeCandidates = getBrowserTextResponseCandidates();
   const beforeKeys = new Set(beforeCandidates.map(getBrowserTextResponseNodeKey));
@@ -2066,7 +2226,31 @@ async function runBrowserTextJob(job: any, apiUrl: string, authToken: string) {
   await clickElementLikeUser(sendBtn);
   debugLog('text job 已触发发送按钮点击', { id: job.id });
 
-  const response = await waitForBrowserTextResponse(beforeKeys, prompt, 10 * 60 * 1000);
+  const reportChunk: BrowserTextChunkReporter = async (content, metadata) => {
+    const chunkResp = await bgFetch(`${apiUrl}/bridge/text-jobs/${encodeURIComponent(job.id)}/chunk`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        content,
+        metadata: {
+          site_id: adapter.id,
+          worker_id: browserTextWorkerID,
+          conversation_id: getConversationId(),
+          page_url: location.href,
+          page_title: document.title || '',
+          ...metadata,
+        },
+      }),
+    });
+    if (!chunkResp.ok) {
+      debugLog('text job 增量回传失败', { id: job.id, status: chunkResp.status, body: chunkResp.body.slice(0, 200) });
+    }
+  };
+
+  const response = await waitForBrowserTextResponse(beforeKeys, prompt, 10 * 60 * 1000, reportChunk);
   debugLog('text job 检测到稳定响应', { id: job.id, length: response.text.length, key: response.key });
 
   const resultResp = await bgFetch(`${apiUrl}/bridge/text-jobs/${encodeURIComponent(job.id)}/result`, {
@@ -2079,6 +2263,10 @@ async function runBrowserTextJob(job: any, apiUrl: string, authToken: string) {
       content: response.text,
       metadata: {
         site_id: adapter.id,
+        worker_id: browserTextWorkerID,
+        conversation_id: getConversationId(),
+        page_url: location.href,
+        page_title: document.title || '',
         response_key: response.key,
       },
     }),
@@ -2108,6 +2296,10 @@ async function setBrowserTextPrompt(editor: HTMLElement, text: string): Promise<
     await setChatGPTPrompt(editor, text);
     return;
   }
+  if (adapter.id === 'kimi') {
+    await setKimiPrompt(editor, text);
+    return;
+  }
   if (adapter.id === 'qwen' && editor instanceof HTMLTextAreaElement) {
     setQwenPrompt(editor, text);
     await sleep(250);
@@ -2133,11 +2325,70 @@ async function setBrowserTextPrompt(editor: HTMLElement, text: string): Promise<
   editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
   editor.dispatchEvent(new Event('change', { bubbles: true }));
   await sleep(250);
-  if (!getEditorText(editor).includes(text.trim())) {
-    editor.textContent = text;
+  if (normalizeEditorPlainText(getEditorText(editor)) !== normalizeEditorPlainText(text)) {
+    setContentEditablePlainText(editor, text);
     editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
     editor.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(250);
   }
+}
+
+async function setKimiPrompt(editor: HTMLElement, text: string): Promise<void> {
+  if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
+    applyTextareaValue(editor as HTMLTextAreaElement, text);
+    await sleep(250);
+    return;
+  }
+
+  insertContentEditableText(editor, text);
+  await sleep(250);
+  if (normalizeEditorPlainText(getEditorText(editor)) !== normalizeEditorPlainText(text)) {
+    insertContentEditableText(editor, text);
+    await sleep(250);
+  }
+  const actual = normalizeEditorPlainText(getEditorText(editor));
+  const expected = normalizeEditorPlainText(text);
+  if (actual !== expected) {
+    throw new Error(`kimi prompt write mismatch: expected_len=${expected.length} actual_len=${actual.length} actual_preview=${actual.slice(0, 120)}`);
+  }
+}
+
+function insertContentEditableText(editor: HTMLElement, text: string): void {
+  editor.focus();
+  try {
+    const selection = window.getSelection();
+    if (selection) {
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    document.execCommand('delete', false);
+    document.execCommand('insertText', false, text);
+  } catch {
+    setContentEditablePlainText(editor, text);
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  editor.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function normalizeEditorPlainText(text: string): string {
+  return text.replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n').trim();
+}
+
+function setContentEditablePlainText(editor: HTMLElement, text: string): void {
+  editor.focus();
+  try {
+    const selection = window.getSelection();
+    if (selection) {
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    document.execCommand('delete', false);
+  } catch {}
+  editor.textContent = text;
 }
 
 async function waitForBrowserTextSendButton(editor: HTMLElement, timeoutMs: number): Promise<HTMLElement | null> {
@@ -2171,11 +2422,110 @@ function getBrowserTextResponseCandidates(): HTMLElement[] {
   const selector = adapter.config.responseSelector;
   if (!selector) return [];
   return Array.from(document.querySelectorAll<HTMLElement>(selector))
-    .filter((el) => el.isConnected && isVisibleElement(el) && adapter.isAssistantResponse(el));
+    .filter((el) => {
+      if (!el.isConnected || !isVisibleElement(el) || !adapter.isAssistantResponse(el)) return false;
+      if (adapter.id === 'deepseek' && el.closest('.ds-think-content')) return false;
+      return true;
+    });
+}
+
+function getDeepSeekMessageRoot(el: Element | null): Element | null {
+  return el?.closest('[data-virtual-list-item-key]') ?? null;
+}
+
+function getDeepSeekLatestResponseState(target?: HTMLElement | null): Record<string, unknown> {
+  const message = getDeepSeekMessageRoot(target ?? null)
+    ?? Array.from(document.querySelectorAll<HTMLElement>('[data-virtual-list-item-key]'))
+      .filter((el) => !!el.querySelector('.ds-message .ds-markdown'))
+      .at(-1)
+    ?? null;
+  if (!message) return { found: false };
+  const markdowns = Array.from(message.querySelectorAll<HTMLElement>('.ds-markdown'));
+  const thinkMarkdowns = markdowns.filter((el) => !!el.closest('.ds-think-content'));
+  const answerMarkdowns = markdowns.filter((el) => !el.closest('.ds-think-content'));
+  const buttons = Array.from(message.querySelectorAll<HTMLElement>('button, [role="button"]')).filter((el) => isVisibleElement(el));
+  const childClasses = Array.from(message.children).map((child) => ({
+    tag: child.tagName.toLowerCase(),
+    className: child.className || '',
+    text: (child.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+  }));
+  const latestAnswer = answerMarkdowns.at(-1) ?? null;
+  const latestThink = thinkMarkdowns.at(-1) ?? null;
+  const afterAnswerButtonCount = latestAnswer
+    ? buttons.filter((button) => !!(latestAnswer.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING)).length
+    : 0;
+  return {
+    found: true,
+    key: message.getAttribute('data-virtual-list-item-key') || '',
+    markdownCount: markdowns.length,
+    thinkMarkdownCount: thinkMarkdowns.length,
+    answerMarkdownCount: answerMarkdowns.length,
+    thinkContentCount: message.querySelectorAll('.ds-think-content').length,
+    actionButtonCount: buttons.length,
+    afterAnswerButtonCount,
+    childClasses,
+    latestThinkLength: latestThink ? getBrowserTextResponseText(latestThink).length : 0,
+    latestAnswerLength: latestAnswer ? getBrowserTextResponseText(latestAnswer).length : 0,
+    latestAnswerPreview: latestAnswer ? getBrowserTextResponseText(latestAnswer).slice(0, 160) : '',
+  };
+}
+
+function getBrowserTextResponseDebugSummary(candidates: HTMLElement[], pollCount: number): Record<string, unknown> {
+  const adapter = getSiteAdapter();
+  const summary: Record<string, unknown> = {
+    pollCount,
+    candidateCount: candidates.length,
+    latestKeys: candidates.slice(-3).map((el) => getBrowserTextResponseNodeKey(el)),
+  };
+  if (adapter.id === 'deepseek') {
+    summary.deepseek = getDeepSeekLatestResponseState(candidates.at(-1) ?? null);
+  }
+  if (adapter.id === 'kimi') {
+    summary.kimi = getKimiLatestResponseState(candidates.at(-1) ?? null);
+  }
+  return summary;
+}
+
+function isDeepSeekResponseComplete(el: HTMLElement): boolean {
+  const state = getDeepSeekLatestResponseState(el);
+  return state.found === true && Number(state.answerMarkdownCount || 0) > 0 && Number(state.afterAnswerButtonCount || 0) > 0;
+}
+
+function getKimiMessageRoot(el: Element | null): Element | null {
+  return el?.closest('.segment-assistant, .chat-content-item-assistant') ?? null;
+}
+
+function getKimiLatestResponseState(target?: HTMLElement | null): Record<string, unknown> {
+  const message = getKimiMessageRoot(target ?? null)
+    ?? Array.from(document.querySelectorAll<HTMLElement>('.segment-assistant, .chat-content-item-assistant'))
+      .filter((el) => !!el.querySelector('.markdown, .markdown-container'))
+      .at(-1)
+    ?? null;
+  if (!message) return { found: false };
+  const markdown = message.querySelector<HTMLElement>('.markdown, .markdown-container');
+  const actions = Array.from(message.querySelectorAll<HTMLElement>('.segment-assistant-actions, .segment-assistant-actions-content'))
+    .filter((el) => isVisibleElement(el));
+  const afterAnswerActionCount = markdown
+    ? actions.filter((action) => !!(markdown.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING)).length
+    : 0;
+  return {
+    found: true,
+    rootClassName: message.className || '',
+    markdownCount: message.querySelectorAll('.markdown, .markdown-container').length,
+    actionCount: actions.length,
+    afterAnswerActionCount,
+    textLength: markdown ? getBrowserTextResponseText(markdown).length : 0,
+    textPreview: markdown ? getBrowserTextResponseText(markdown).slice(0, 160) : '',
+  };
+}
+
+function isKimiResponseComplete(el: HTMLElement): boolean {
+  const state = getKimiLatestResponseState(el);
+  return state.found === true && Number(state.markdownCount || 0) > 0 && Number(state.afterAnswerActionCount || 0) > 0;
 }
 
 function getBrowserTextResponseNodeKey(el: HTMLElement): string {
-  const stable = el.closest('[data-message-id], [data-virtual-list-item-key], [data-testid="receive_message"], .chat-response-message, model-response, [data-message-author-role="assistant"]');
+  const stable = el.closest('[data-message-id], [data-virtual-list-item-key], [data-testid="receive_message"], .chat-response-message, .segment-assistant, .chat-content-item-assistant, model-response, [data-message-author-role="assistant"]');
   const id = stable?.getAttribute('data-message-id')
     || stable?.getAttribute('data-virtual-list-item-key')
     || stable?.getAttribute('id')
@@ -2184,9 +2534,163 @@ function getBrowserTextResponseNodeKey(el: HTMLElement): string {
 }
 
 function getBrowserTextResponseText(el: HTMLElement): string {
+  if (getSiteAdapter().id === 'deepseek') return getDeepSeekMarkdownText(el);
+  if (getSiteAdapter().id === 'kimi') return getKimiMarkdownText(el);
   const clone = el.cloneNode(true) as HTMLElement;
   clone.querySelectorAll('button, [role="button"], nav, [data-testid*="action"], [data-testid="message_action_bar"], .message-hoc-container').forEach((node) => node.remove());
   return (clone.innerText || clone.textContent || '').replace(/\u00a0/g, ' ').trim();
+}
+
+function getDeepSeekMarkdownText(el: HTMLElement): string {
+  const clone = el.cloneNode(true) as HTMLElement;
+  clone.querySelectorAll('button, [role="button"], nav, svg, style, script, .message-hoc-container, .f93f59e4, .ds-markdown-cite, ._2ed5dee').forEach((node) => node.remove());
+  return normalizeMarkdownBlocks(renderMarkdownBlocks(clone).join('\n\n'));
+}
+
+function getKimiMarkdownText(el: HTMLElement): string {
+  const clone = el.cloneNode(true) as HTMLElement;
+  clone.querySelectorAll('button, [role="button"], nav, svg, style, script, .segment-assistant-actions, .segment-user-actions, .table-actions, .icon-button').forEach((node) => node.remove());
+  return normalizeMarkdownBlocks(renderMarkdownBlocks(clone).join('\n\n'));
+}
+
+function normalizeMarkdownBlocks(text: string): string {
+  return text
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function renderMarkdownBlocks(root: Element): string[] {
+  const blocks: string[] = [];
+  for (const child of Array.from(root.childNodes)) {
+    blocks.push(...renderMarkdownNode(child, 0));
+  }
+  return blocks.map((block) => block.trim()).filter(Boolean);
+}
+
+function renderMarkdownNode(node: Node, depth: number): string[] {
+  if (node.nodeType === Node.TEXT_NODE) {
+    const text = normalizeInlineWhitespace(node.textContent || '');
+    return text ? [text] : [];
+  }
+  if (node.nodeType !== Node.ELEMENT_NODE) return [];
+  const el = node as HTMLElement;
+  const tag = el.tagName.toLowerCase();
+
+  if (tag === 'br') return ['\n'];
+  if (tag === 'p') return [renderMarkdownInlineChildren(el).trim()].filter(Boolean);
+  if (tag === 'div' && el.classList.contains('paragraph')) return [renderMarkdownInlineChildren(el).trim()].filter(Boolean);
+  if (tag === 'div' && el.classList.contains('table-container')) return renderMarkdownBlocks(el);
+  if (tag === 'div' && el.classList.contains('markdown-table')) {
+    const table = el.querySelector('table');
+    return table ? [renderMarkdownTable(table)].filter(Boolean) : renderMarkdownBlocks(el);
+  }
+  if (/^h[1-6]$/.test(tag)) {
+    const level = Number(tag.slice(1));
+    const text = renderMarkdownInlineChildren(el).trim();
+    return text ? [`${'#'.repeat(level)} ${text}`] : [];
+  }
+  if (tag === 'ul' || tag === 'ol') return renderMarkdownList(el, depth, tag === 'ol');
+  if (tag === 'pre') return [renderMarkdownPre(el)];
+  if (tag === 'blockquote') {
+    return renderMarkdownBlocks(el).map((block) => block.split('\n').map((line) => `> ${line}`).join('\n'));
+  }
+  if (tag === 'table') return [renderMarkdownTable(el)].filter(Boolean);
+  if (tag === 'div' || tag === 'section' || tag === 'article') return renderMarkdownBlocks(el);
+
+  const inline = renderMarkdownInline(el).trim();
+  return inline ? [inline] : [];
+}
+
+function renderMarkdownList(listEl: Element, depth: number, ordered: boolean): string[] {
+  const lines: string[] = [];
+  let index = 1;
+  for (const li of Array.from(listEl.children).filter((child) => child.tagName.toLowerCase() === 'li')) {
+    const marker = ordered ? `${index}.` : '-';
+    const itemLines = renderMarkdownListItem(li as HTMLElement, depth);
+    if (itemLines.length === 0) continue;
+    const indent = '  '.repeat(depth);
+    lines.push(`${indent}${marker} ${itemLines[0]}`);
+    for (const extra of itemLines.slice(1)) {
+      lines.push(extra ? `${indent}  ${extra}` : '');
+    }
+    index += 1;
+  }
+  return lines.length ? [lines.join('\n')] : [];
+}
+
+function renderMarkdownListItem(li: HTMLElement, depth: number): string[] {
+  const lines: string[] = [];
+  let inlineParts: string[] = [];
+  const flushInline = () => {
+    const text = inlineParts.join('').trim();
+    if (text) lines.push(text);
+    inlineParts = [];
+  };
+
+  for (const child of Array.from(li.childNodes)) {
+    if (child.nodeType === Node.ELEMENT_NODE) {
+      const tag = (child as Element).tagName.toLowerCase();
+      if (tag === 'ul' || tag === 'ol') {
+        flushInline();
+        lines.push(...renderMarkdownList(child as Element, depth + 1, tag === 'ol').join('\n').split('\n'));
+        continue;
+      }
+      if (tag === 'p') {
+        flushInline();
+        const text = renderMarkdownInlineChildren(child as HTMLElement).trim();
+        if (text) lines.push(text);
+        continue;
+      }
+    }
+    inlineParts.push(renderMarkdownInline(child));
+  }
+  flushInline();
+  return lines;
+}
+
+function renderMarkdownPre(pre: Element): string {
+  const code = pre.querySelector('code');
+  const languageClass = code?.className.match(/language-([\w-]+)/)?.[1] || '';
+  const text = (code?.textContent || pre.textContent || '').replace(/\n+$/, '');
+  return `\`\`\`${languageClass}\n${text}\n\`\`\``;
+}
+
+function renderMarkdownTable(table: Element): string {
+  const rows = Array.from(table.querySelectorAll('tr')).map((tr) => Array.from(tr.children).map((cell) => renderMarkdownInlineChildren(cell as HTMLElement).trim()));
+  if (rows.length === 0) return '';
+  const header = rows[0];
+  const separator = header.map(() => '---');
+  const body = rows.slice(1);
+  return [header, separator, ...body].map((row) => `| ${row.join(' | ')} |`).join('\n');
+}
+
+function renderMarkdownInlineChildren(el: Element): string {
+  return Array.from(el.childNodes).map((child) => renderMarkdownInline(child)).join('').replace(/[ \t]+/g, ' ').trim();
+}
+
+function renderMarkdownInline(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) return normalizeInlineWhitespace(node.textContent || '');
+  if (node.nodeType !== Node.ELEMENT_NODE) return '';
+  const el = node as HTMLElement;
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'br') return '\n';
+  if (el.getAttribute('aria-hidden') === 'true') return '';
+  if (tag === 'svg' || tag === 'style' || tag === 'script') return '';
+  if (el.classList.contains('ds-markdown-cite') || el.classList.contains('_2ed5dee')) return '';
+
+  const text = renderMarkdownInlineChildren(el);
+  if (!text) return '';
+  if (tag === 'strong' || tag === 'b') return `**${text}**`;
+  if (tag === 'em' || tag === 'i') return `*${text}*`;
+  if (tag === 'code') return `\`${text.replace(/`/g, '\\`')}\``;
+  if (tag === 'a') return text;
+  return text;
+}
+
+function normalizeInlineWhitespace(text: string): string {
+  return text.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ');
 }
 
 function isLikelyBrowserTextOutput(text: string, prompt: string): boolean {
@@ -2197,21 +2701,19 @@ function isLikelyBrowserTextOutput(text: string, prompt: string): boolean {
   return true;
 }
 
-async function waitForBrowserTextResponse(beforeKeys: Set<string>, prompt: string, timeoutMs: number): Promise<{ key: string; text: string }> {
+async function waitForBrowserTextResponse(beforeKeys: Set<string>, prompt: string, timeoutMs: number, reportChunk?: BrowserTextChunkReporter): Promise<{ key: string; text: string }> {
   const deadline = Date.now() + timeoutMs;
   let candidate: HTMLElement | null = null;
   let candidateKey = '';
   let pollCount = 0;
   let lastSummary = '';
+  const adapter = getSiteAdapter();
   while (Date.now() < deadline) {
     pollCount += 1;
     const candidates = getBrowserTextResponseCandidates();
-    const summary = JSON.stringify({
-      pollCount,
-      candidateCount: candidates.length,
-      latestKeys: candidates.slice(-3).map((el) => getBrowserTextResponseNodeKey(el)),
-    });
-    if (summary !== lastSummary && (pollCount <= 5 || pollCount % 10 === 0)) {
+    const summaryObject = getBrowserTextResponseDebugSummary(candidates, pollCount);
+    const summary = JSON.stringify(summaryObject);
+    if (summary !== lastSummary && (adapter.id === 'deepseek' || adapter.id === 'kimi' || pollCount <= 5 || pollCount % 10 === 0)) {
       lastSummary = summary;
       debugLog('text job 响应轮询状态', JSON.parse(summary));
     }
@@ -2222,12 +2724,14 @@ async function waitForBrowserTextResponse(beforeKeys: Set<string>, prompt: strin
       if (!beforeKeys.has(key) && isLikelyBrowserTextOutput(text, prompt)) {
         candidate = el;
         candidateKey = key;
+        if (adapter.id === 'deepseek') debugLog('deepseek 候选响应结构', getDeepSeekLatestResponseState(el));
+        if (adapter.id === 'kimi') debugLog('kimi 候选响应结构', getKimiLatestResponseState(el));
         debugLog('text job 捕获到候选响应', { key, length: text.length, preview: text.slice(0, 160) });
         break;
       }
     }
     if (candidate) {
-      const text = await waitForBrowserTextStability(candidate, prompt, 1600, Math.min(120000, timeoutMs));
+      const text = await waitForBrowserTextStability(candidate, prompt, 1600, Math.min(120000, timeoutMs), candidateKey, reportChunk);
       return { key: candidateKey, text };
     }
     await sleep(500);
@@ -2236,20 +2740,51 @@ async function waitForBrowserTextResponse(beforeKeys: Set<string>, prompt: strin
   throw new Error('wait for browser text response timed out');
 }
 
-async function waitForBrowserTextStability(el: HTMLElement, prompt: string, quietMs: number, timeoutMs: number): Promise<string> {
+async function waitForBrowserTextStability(el: HTMLElement, prompt: string, quietMs: number, timeoutMs: number, responseKey: string, reportChunk?: BrowserTextChunkReporter): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   let lastText = '';
   let stableSince = 0;
   let lastLoggedText = '';
+  let seenManualEndSeq = manualBrowserTextEndSeq;
+  let lastReportedText = '';
+  const adapter = getSiteAdapter();
   while (Date.now() < deadline) {
     const text = getBrowserTextResponseText(el);
+    if (manualBrowserTextEndSeq !== seenManualEndSeq && isLikelyBrowserTextOutput(text, prompt)) {
+      seenManualEndSeq = manualBrowserTextEndSeq;
+      if (reportChunk && text !== lastReportedText) {
+        await reportChunk(text, { response_key: responseKey, stable: 'manual_end', length: String(text.length) });
+        lastReportedText = text;
+      }
+      debugLog('text job 使用手动结束标记返回响应', { seq: manualBrowserTextEndSeq, length: text.length, preview: text.slice(0, 160), deepseek: adapter.id === 'deepseek' ? getDeepSeekLatestResponseState(el) : null });
+      return text;
+    }
     if (text !== lastLoggedText) {
       lastLoggedText = text;
+      if (adapter.id === 'deepseek') debugLog('deepseek 响应结构更新', getDeepSeekLatestResponseState(el));
+      if (adapter.id === 'kimi') debugLog('kimi 响应结构更新', getKimiLatestResponseState(el));
       debugLog('text job 响应内容更新', { length: text.length, preview: text.slice(0, 160) });
     }
     if (isLikelyBrowserTextOutput(text, prompt) && text === lastText) {
       if (!stableSince) stableSince = Date.now();
       if (Date.now() - stableSince >= quietMs) {
+        if (reportChunk && text !== lastReportedText) {
+          await reportChunk(text, { response_key: responseKey, stable: 'true', length: String(text.length) });
+          lastReportedText = text;
+          debugLog('text job 稳定片段已回传', { key: responseKey, length: text.length, deepseek: adapter.id === 'deepseek' ? getDeepSeekLatestResponseState(el) : null });
+        }
+        if (adapter.id === 'deepseek' && !isDeepSeekResponseComplete(el)) {
+          debugLog('deepseek 响应文本已稳定但未见结束标志，继续等待', getDeepSeekLatestResponseState(el));
+          stableSince = 0;
+          await sleep(500);
+          continue;
+        }
+        if (adapter.id === 'kimi' && !isKimiResponseComplete(el)) {
+          debugLog('kimi 响应文本已稳定但未见结束标志，继续等待', getKimiLatestResponseState(el));
+          stableSince = 0;
+          await sleep(500);
+          continue;
+        }
         debugLog('text job 响应已稳定', { quietMs, length: text.length, preview: text.slice(0, 160) });
         return text;
       }

@@ -8,18 +8,55 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+function isTextJobBridgeURL(url: string): boolean {
+  return /\/bridge\/(?:text-workers\/register|text-jobs\/(?:next|[^/]+\/(?:chunk|result)))(?:[?#]|$)/.test(url);
+}
+
+function shouldLogTextBridgeURL(url: string): boolean {
+  return !/\/bridge\/text-jobs\/next(?:[?#]|$)/.test(url) && isTextJobBridgeURL(url);
+}
+
+function withOpenLinkTabHeaders(url: string, options: any, sender: chrome.runtime.MessageSender): any {
+  if (!isTextJobBridgeURL(url)) return options;
+  const headers = {
+    ...((options && options.headers) || {}),
+    ...(sender.tab?.id != null ? { 'X-OpenLink-Tab-Id': String(sender.tab.id) } : {}),
+    ...(sender.tab?.windowId != null ? { 'X-OpenLink-Window-Id': String(sender.tab.windowId) } : {}),
+    ...(sender.frameId != null ? { 'X-OpenLink-Frame-Id': String(sender.frameId) } : {}),
+  };
+  return { ...(options || {}), headers };
+}
+
+function logTextBridgeForward(url: string, sender: chrome.runtime.MessageSender, phase: string, extra: Record<string, unknown> = {}) {
+  if (!shouldLogTextBridgeURL(url)) return;
+  console.log('[OpenLink][Background][TextBridge]', phase, {
+    tabId: sender.tab?.id ?? null,
+    windowId: sender.tab?.windowId ?? null,
+    frameId: sender.frameId ?? null,
+    tabUrl: sender.tab?.url || '',
+    requestUrl: url,
+    ...extra,
+  });
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'FETCH') {
     const { url, options } = msg;
-    fetch(url, options)
+    const requestOptions = withOpenLinkTabHeaders(url, options, sender);
+    logTextBridgeForward(url, sender, 'fetch start');
+    fetch(url, requestOptions)
       .then(async r => ({ ok: r.ok, status: r.status, body: await r.text() }))
       .catch(e => ({ ok: false, status: 0, body: String(e) }))
-      .then(sendResponse);
+      .then((resp) => {
+        logTextBridgeForward(url, sender, 'fetch done', { ok: resp.ok, status: resp.status });
+        sendResponse(resp);
+      });
     return true;
   }
   if (msg.type === 'FETCH_BINARY') {
     const { url, options } = msg;
-    fetch(url, options)
+    const requestOptions = withOpenLinkTabHeaders(url, options, sender);
+    fetch(url, requestOptions)
       .then(async (r) => ({
         ok: r.ok,
         status: r.status,

@@ -31,11 +31,19 @@ type textJobResult struct {
 	Error    string            `json:"error,omitempty"`
 }
 
+type textJobChunk struct {
+	Content   string
+	Metadata  map[string]string
+	CreatedAt time.Time
+}
+
 type textJobBridge struct {
 	mu        sync.Mutex
 	pending   []*textJob
 	inflight  map[string]*textJob
 	waiters   map[string]chan *textJobResult
+	chunks    map[string]chan *textJobChunk
+	workers   map[string]textWorkerSnapshot
 	idCounter atomic.Uint64
 }
 
@@ -43,7 +51,108 @@ func newTextJobBridge() *textJobBridge {
 	return &textJobBridge{
 		inflight: map[string]*textJob{},
 		waiters:  map[string]chan *textJobResult{},
+		chunks:   map[string]chan *textJobChunk{},
+		workers:  map[string]textWorkerSnapshot{},
 	}
+}
+
+type textWorkerSnapshot struct {
+	Key            string
+	SiteID         string
+	WorkerID       string
+	TabID          string
+	WindowID       string
+	FrameID        string
+	URL            string
+	Title          string
+	ConversationID string
+	Visibility     string
+	Focused        string
+	Idle           bool
+	BusyJobID      string
+	LastSeen       time.Time
+}
+
+func (b *textJobBridge) registerWorker(snapshot textWorkerSnapshot) textWorkerSnapshot {
+	snapshot.SiteID = strings.TrimSpace(snapshot.SiteID)
+	snapshot.WorkerID = strings.TrimSpace(snapshot.WorkerID)
+	snapshot.TabID = strings.TrimSpace(snapshot.TabID)
+	snapshot.WindowID = strings.TrimSpace(snapshot.WindowID)
+	snapshot.FrameID = strings.TrimSpace(snapshot.FrameID)
+	snapshot.URL = strings.TrimSpace(snapshot.URL)
+	snapshot.Title = strings.TrimSpace(snapshot.Title)
+	snapshot.ConversationID = strings.TrimSpace(snapshot.ConversationID)
+	snapshot.Visibility = strings.TrimSpace(snapshot.Visibility)
+	snapshot.Focused = strings.TrimSpace(snapshot.Focused)
+	snapshot.BusyJobID = strings.TrimSpace(snapshot.BusyJobID)
+	if snapshot.Key == "" {
+		switch {
+		case snapshot.TabID != "":
+			snapshot.Key = "tab:" + snapshot.TabID
+		case snapshot.WorkerID != "":
+			snapshot.Key = "worker:" + snapshot.WorkerID
+		default:
+			snapshot.Key = snapshot.SiteID + ":" + snapshot.URL
+		}
+	}
+	snapshot.LastSeen = time.Now()
+
+	b.mu.Lock()
+	b.workers[snapshot.Key] = snapshot
+	b.mu.Unlock()
+	return snapshot
+}
+
+func (b *textJobBridge) rememberWorkerBusy(key, jobID string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	b.mu.Lock()
+	snapshot, ok := b.workers[key]
+	if ok {
+		snapshot.Idle = false
+		snapshot.BusyJobID = strings.TrimSpace(jobID)
+		snapshot.LastSeen = time.Now()
+		b.workers[key] = snapshot
+	}
+	b.mu.Unlock()
+}
+
+func (b *textJobBridge) clearWorkerBusyByJob(jobID string) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return
+	}
+	b.mu.Lock()
+	for key, snapshot := range b.workers {
+		if snapshot.BusyJobID == jobID {
+			snapshot.Idle = true
+			snapshot.BusyJobID = ""
+			snapshot.LastSeen = time.Now()
+			b.workers[key] = snapshot
+		}
+	}
+	b.mu.Unlock()
+}
+
+func (b *textJobBridge) workerSnapshots(siteID string, maxAge time.Duration) []textWorkerSnapshot {
+	siteID = strings.TrimSpace(siteID)
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	items := make([]textWorkerSnapshot, 0, len(b.workers))
+	for key, snapshot := range b.workers {
+		if maxAge > 0 && now.Sub(snapshot.LastSeen) > maxAge {
+			delete(b.workers, key)
+			continue
+		}
+		if siteID != "" && snapshot.SiteID != "" && snapshot.SiteID != siteID {
+			continue
+		}
+		items = append(items, snapshot)
+	}
+	return items
 }
 
 func (b *textJobBridge) enqueue(siteID, prompt, model string, messages []textJobMessage) (*textJob, chan *textJobResult) {
@@ -61,11 +170,57 @@ func (b *textJobBridge) enqueue(siteID, prompt, model string, messages []textJob
 	b.mu.Lock()
 	b.pending = append(b.pending, job)
 	b.waiters[job.ID] = ch
+	b.chunks[job.ID] = make(chan *textJobChunk, 32)
 	pendingCount := len(b.pending)
 	inflightCount := len(b.inflight)
 	b.mu.Unlock()
 	log.Printf("[OpenLink][TextBridge] enqueue job=%s site=%s model=%s prompt_len=%d messages=%d pending=%d inflight=%d", job.ID, job.SiteID, job.Model, len(strings.TrimSpace(job.Prompt)), len(job.Messages), pendingCount, inflightCount)
 	return job, ch
+}
+
+func (b *textJobBridge) chunkChannel(jobID string) (<-chan *textJobChunk, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ch, ok := b.chunks[jobID]
+	return ch, ok
+}
+
+func (b *textJobBridge) reportChunk(jobID, content string, metadata map[string]string) error {
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+
+	b.mu.Lock()
+	ch, ok := b.chunks[jobID]
+	_, inflight := b.inflight[jobID]
+	b.mu.Unlock()
+	if !ok || !inflight {
+		return errors.New("text job not found")
+	}
+
+	chunk := &textJobChunk{Content: content, Metadata: cloneTextMetadata(metadata), CreatedAt: time.Now()}
+	b.mu.Lock()
+	ch, ok = b.chunks[jobID]
+	_, inflight = b.inflight[jobID]
+	if !ok || !inflight {
+		b.mu.Unlock()
+		return errors.New("text job not found")
+	}
+	select {
+	case ch <- chunk:
+	default:
+		select {
+		case <-ch:
+		default:
+		}
+		select {
+		case ch <- chunk:
+		default:
+		}
+	}
+	b.mu.Unlock()
+	log.Printf("[OpenLink][TextBridge] chunk job=%s content_len=%d metadata=%v", jobID, len(content), metadata)
+	return nil
 }
 
 func (b *textJobBridge) enqueueAndWait(ctx context.Context, siteID, prompt, model string, messages []textJobMessage) (*textJob, *textJobResult, error) {
@@ -119,6 +274,18 @@ func (b *textJobBridge) complete(jobID, content string, metadata map[string]stri
 		delete(b.inflight, jobID)
 	}
 	delete(b.waiters, jobID)
+	if chunkCh := b.chunks[jobID]; chunkCh != nil {
+		close(chunkCh)
+	}
+	delete(b.chunks, jobID)
+	for key, snapshot := range b.workers {
+		if snapshot.BusyJobID == jobID {
+			snapshot.Idle = true
+			snapshot.BusyJobID = ""
+			snapshot.LastSeen = time.Now()
+			b.workers[key] = snapshot
+		}
+	}
 	b.mu.Unlock()
 
 	if !ok || waiter == nil {
@@ -141,6 +308,18 @@ func (b *textJobBridge) failWithError(jobID, message string) {
 	waiter := b.waiters[jobID]
 	delete(b.waiters, jobID)
 	delete(b.inflight, jobID)
+	if chunkCh := b.chunks[jobID]; chunkCh != nil {
+		close(chunkCh)
+	}
+	delete(b.chunks, jobID)
+	for key, snapshot := range b.workers {
+		if snapshot.BusyJobID == jobID {
+			snapshot.Idle = true
+			snapshot.BusyJobID = ""
+			snapshot.LastSeen = time.Now()
+			b.workers[key] = snapshot
+		}
+	}
 	b.mu.Unlock()
 	log.Printf("[OpenLink][TextBridge] fail job=%s error=%q waiter=%v", jobID, strings.TrimSpace(message), waiter != nil)
 	if waiter != nil {
@@ -154,6 +333,18 @@ func (b *textJobBridge) remove(jobID string) {
 	defer b.mu.Unlock()
 	delete(b.waiters, jobID)
 	delete(b.inflight, jobID)
+	if chunkCh := b.chunks[jobID]; chunkCh != nil {
+		close(chunkCh)
+	}
+	delete(b.chunks, jobID)
+	for key, snapshot := range b.workers {
+		if snapshot.BusyJobID == jobID {
+			snapshot.Idle = true
+			snapshot.BusyJobID = ""
+			snapshot.LastSeen = time.Now()
+			b.workers[key] = snapshot
+		}
+	}
 	for i, pending := range b.pending {
 		if pending.ID == jobID {
 			b.pending = append(b.pending[:i], b.pending[i+1:]...)

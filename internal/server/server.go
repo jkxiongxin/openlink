@@ -71,7 +71,9 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/files", s.handleListFiles)
 	s.router.GET("/bridge/image-jobs/next", s.handleImageJobNext)
 	s.router.POST("/bridge/image-jobs/:id/result", s.handleImageJobResult)
+	s.router.GET("/bridge/text-workers/register", s.handleTextWorkerRegister)
 	s.router.GET("/bridge/text-jobs/next", s.handleTextJobNext)
+	s.router.POST("/bridge/text-jobs/:id/chunk", s.handleTextJobChunk)
 	s.router.POST("/bridge/text-jobs/:id/result", s.handleTextJobResult)
 	s.router.GET("/v1/models", s.handleOpenAIModels)
 	s.router.POST("/v1/chat/completions", s.handleOpenAIChatCompletions)
@@ -545,6 +547,62 @@ func (s *Server) openAITextTimeout() time.Duration {
 	return cfgTimeout
 }
 
+func shortenLogValue(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if max <= 0 || len(value) <= max {
+		return value
+	}
+	return value[:max] + "...(truncated)"
+}
+
+func (s *Server) logTextWorkerSnapshot(reason, siteID string) {
+	workers := s.textJobBridge.workerSnapshots(siteID, 30*time.Second)
+	idleCount := 0
+	for _, worker := range workers {
+		if worker.Idle && worker.BusyJobID == "" {
+			idleCount++
+		}
+	}
+	log.Printf("[OpenLink][TextJobAPI] %s site=%s known_workers=%d idle_workers=%d", reason, siteID, len(workers), idleCount)
+	if len(workers) == 0 {
+		log.Printf("[OpenLink][TextJobAPI] no browser text workers seen for site=%s; check that the target page is open/refreshed after extension reload and that the content script is polling /bridge/text-jobs/next", siteID)
+	}
+	for _, worker := range workers {
+		log.Printf("[OpenLink][TextJobAPI] worker site=%s worker=%s tab=%s window=%s frame=%s idle=%v busy_job=%s visibility=%s focused=%s conversation=%s seen=%s url=%s title=%q",
+			worker.SiteID,
+			worker.WorkerID,
+			worker.TabID,
+			worker.WindowID,
+			worker.FrameID,
+			worker.Idle && worker.BusyJobID == "",
+			worker.BusyJobID,
+			worker.Visibility,
+			worker.Focused,
+			worker.ConversationID,
+			time.Since(worker.LastSeen).Round(time.Millisecond),
+			shortenLogValue(worker.URL, 180),
+			shortenLogValue(worker.Title, 80),
+		)
+	}
+}
+
+func (s *Server) textWorkerSnapshotFromRequest(c *gin.Context, siteID string) textWorkerSnapshot {
+	return textWorkerSnapshot{
+		SiteID:         siteID,
+		WorkerID:       c.Query("worker_id"),
+		TabID:          c.GetHeader("X-OpenLink-Tab-Id"),
+		WindowID:       c.GetHeader("X-OpenLink-Window-Id"),
+		FrameID:        c.GetHeader("X-OpenLink-Frame-Id"),
+		URL:            c.Query("page_url"),
+		Title:          c.Query("page_title"),
+		ConversationID: c.Query("conversation_id"),
+		Visibility:     c.Query("visibility"),
+		Focused:        c.Query("focused"),
+		Idle:           c.Query("idle") != "false",
+		BusyJobID:      c.Query("busy_job_id"),
+	}
+}
+
 func (s *Server) handleImageJobNext(c *gin.Context) {
 	siteID := strings.TrimSpace(c.Query("site_id"))
 	job := s.imageJobBridge.nextJob(siteID)
@@ -611,15 +669,39 @@ func (s *Server) handleImageJobResult(c *gin.Context) {
 	})
 }
 
+func (s *Server) handleTextWorkerRegister(c *gin.Context) {
+	siteID := strings.TrimSpace(c.Query("site_id"))
+	worker := s.textJobBridge.registerWorker(s.textWorkerSnapshotFromRequest(c, siteID))
+	log.Printf("[OpenLink][TextJobAPI] register site=%s worker=%s tab=%s window=%s frame=%s idle=%v busy_job=%s visibility=%s focused=%s conversation=%s url=%s title=%q", siteID, worker.WorkerID, worker.TabID, worker.WindowID, worker.FrameID, worker.Idle, worker.BusyJobID, worker.Visibility, worker.Focused, worker.ConversationID, shortenLogValue(worker.URL, 180), shortenLogValue(worker.Title, 80))
+	c.JSON(http.StatusOK, gin.H{
+		"ok": true,
+		"worker": gin.H{
+			"site_id":         worker.SiteID,
+			"worker_id":       worker.WorkerID,
+			"tab_id":          worker.TabID,
+			"window_id":       worker.WindowID,
+			"frame_id":        worker.FrameID,
+			"idle":            worker.Idle,
+			"busy_job_id":     worker.BusyJobID,
+			"visibility":      worker.Visibility,
+			"focused":         worker.Focused,
+			"conversation_id": worker.ConversationID,
+			"url":             worker.URL,
+			"title":           worker.Title,
+		},
+	})
+}
+
 func (s *Server) handleTextJobNext(c *gin.Context) {
 	siteID := strings.TrimSpace(c.Query("site_id"))
+	worker := s.textJobBridge.registerWorker(s.textWorkerSnapshotFromRequest(c, siteID))
 	job := s.textJobBridge.nextJob(siteID)
 	if job == nil {
-		log.Printf("[OpenLink][TextJobAPI] next site=%s -> empty", siteID)
 		c.JSON(http.StatusOK, gin.H{"job": nil})
 		return
 	}
-	log.Printf("[OpenLink][TextJobAPI] next site=%s -> job=%s model=%s age=%s prompt_len=%d messages=%d", siteID, job.ID, job.Model, time.Since(job.CreatedAt).Round(time.Millisecond), len(strings.TrimSpace(job.Prompt)), len(job.Messages))
+	s.textJobBridge.rememberWorkerBusy(worker.Key, job.ID)
+	log.Printf("[OpenLink][TextJobAPI] next site=%s worker=%s tab=%s conversation=%s -> job=%s model=%s age=%s prompt_len=%d messages=%d", siteID, worker.WorkerID, worker.TabID, worker.ConversationID, job.ID, job.Model, time.Since(job.CreatedAt).Round(time.Millisecond), len(strings.TrimSpace(job.Prompt)), len(job.Messages))
 	c.JSON(http.StatusOK, gin.H{
 		"job": gin.H{
 			"id":         job.ID,
@@ -647,6 +729,7 @@ func (s *Server) handleTextJobResult(c *gin.Context) {
 	if strings.TrimSpace(req.Error) != "" {
 		log.Printf("[OpenLink][TextJobAPI] result error job=%s error=%q metadata=%v", jobID, req.Error, req.Metadata)
 		s.textJobBridge.failWithError(jobID, req.Error)
+		s.textJobBridge.clearWorkerBusyByJob(jobID)
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 		return
 	}
@@ -654,14 +737,39 @@ func (s *Server) handleTextJobResult(c *gin.Context) {
 	result, err := s.textJobBridge.complete(jobID, req.Content, req.Metadata)
 	if err != nil {
 		log.Printf("[OpenLink][TextJobAPI] result complete failed job=%s err=%v", jobID, err)
+		s.textJobBridge.clearWorkerBusyByJob(jobID)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	s.textJobBridge.clearWorkerBusyByJob(jobID)
 	c.JSON(http.StatusOK, gin.H{
 		"ok":       true,
 		"length":   len(result.Content),
 		"metadata": result.Metadata,
 	})
+}
+
+func (s *Server) handleTextJobChunk(c *gin.Context) {
+	var req struct {
+		Content  string            `json:"content"`
+		Metadata map[string]string `json:"metadata"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[OpenLink][TextJobAPI] chunk invalid json job=%s err=%v", c.Param("id"), err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+		return
+	}
+	jobID := c.Param("id")
+	if strings.TrimSpace(req.Content) == "" {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "ignored": true})
+		return
+	}
+	if err := s.textJobBridge.reportChunk(jobID, req.Content, req.Metadata); err != nil {
+		log.Printf("[OpenLink][TextJobAPI] chunk rejected job=%s content_len=%d err=%v metadata=%v", jobID, len(strings.TrimSpace(req.Content)), err, req.Metadata)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "length": len(strings.TrimSpace(req.Content))})
 }
 
 func (s *Server) handleGeneratedAsset(c *gin.Context) {

@@ -67,7 +67,7 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 	completionID := fmt.Sprintf("chatcmpl-%d", created)
 	model := normalizeOpenAIModel(req.Model)
 	modelSpec, modelFound := lookupBrowserModel(req.Model)
-	log.Printf("[OpenLink][OpenAI] chat completion received requested_model=%q normalized_model=%q messages=%d prompt_len=%d stream=%v refs=%d structured=%v found=%v", req.Model, model, len(req.Messages), len(strings.TrimSpace(prompt)), req.Stream, len(referenceInputs), isStructuredBrowserModelID(req.Model), modelFound)
+	log.Printf("[OpenLink][OpenAI] chat completion received completion_id=%s requested_model=%q normalized_model=%q messages=%d prompt_len=%d stream=%v refs=%d structured=%v found=%v", completionID, req.Model, model, len(req.Messages), len(strings.TrimSpace(prompt)), req.Stream, len(referenceInputs), isStructuredBrowserModelID(req.Model), modelFound)
 	if !modelFound && isStructuredBrowserModelID(req.Model) {
 		log.Printf("[OpenLink][OpenAI] unsupported browser model requested: %q", req.Model)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported browser model", "model": req.Model})
@@ -222,51 +222,21 @@ func (s *Server) handleOpenAITextChatCompletion(c *gin.Context, req chatCompleti
 	defer cancel()
 	start := time.Now()
 	textMessages := extractTextJobMessages(req.Messages)
-	log.Printf("[OpenLink][OpenAI] text completion start model=%s site=%s prompt_len=%d messages=%d timeout=%s stream=%v", modelSpec.ID, modelSpec.SiteID, len(strings.TrimSpace(prompt)), len(textMessages), s.openAITextTimeout(), req.Stream)
+	log.Printf("[OpenLink][OpenAI] text completion start completion_id=%s model=%s site=%s prompt_len=%d messages=%d timeout=%s stream=%v", completionID, modelSpec.ID, modelSpec.SiteID, len(strings.TrimSpace(prompt)), len(textMessages), s.openAITextTimeout(), req.Stream)
+	s.logTextWorkerSnapshot("text completion enqueue", modelSpec.SiteID)
+
+	if req.Stream {
+		s.handleOpenAIStreamingTextChatCompletion(c, modelSpec, prompt, textMessages, created, completionID, start, ctx)
+		return
+	}
 
 	job, result, err := s.textJobBridge.enqueueAndWait(ctx, modelSpec.SiteID, prompt, modelSpec.ID, textMessages)
 	if err != nil {
-		log.Printf("[OpenLink][OpenAI] text completion failed model=%s site=%s duration=%s err=%v", modelSpec.ID, modelSpec.SiteID, time.Since(start).Round(time.Millisecond), err)
+		log.Printf("[OpenLink][OpenAI] text completion failed completion_id=%s model=%s site=%s duration=%s err=%v", completionID, modelSpec.ID, modelSpec.SiteID, time.Since(start).Round(time.Millisecond), err)
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "browser text completion timed out", "details": err.Error()})
 		return
 	}
-	log.Printf("[OpenLink][OpenAI] text completion success model=%s site=%s job=%s duration=%s content_len=%d metadata=%v", modelSpec.ID, modelSpec.SiteID, job.ID, time.Since(start).Round(time.Millisecond), len(result.Content), result.Metadata)
-
-	if req.Stream {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("X-Accel-Buffering", "no")
-		writeSSEJSON(c, gin.H{
-			"id":      completionID,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   modelSpec.ID,
-			"choices": []gin.H{{
-				"index": 0,
-				"delta": gin.H{
-					"role": "assistant",
-				},
-				"finish_reason": nil,
-			}},
-		})
-		writeSSEJSON(c, gin.H{
-			"id":      completionID,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   modelSpec.ID,
-			"choices": []gin.H{{
-				"index": 0,
-				"delta": gin.H{
-					"content": result.Content,
-				},
-				"finish_reason": "stop",
-			}},
-		})
-		_, _ = c.Writer.Write([]byte("data: [DONE]\n\n"))
-		c.Writer.Flush()
-		return
-	}
+	log.Printf("[OpenLink][OpenAI] text completion success completion_id=%s model=%s site=%s job=%s duration=%s content_len=%d metadata=%v", completionID, modelSpec.ID, modelSpec.SiteID, job.ID, time.Since(start).Round(time.Millisecond), len(result.Content), result.Metadata)
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":      completionID,
@@ -292,6 +262,113 @@ func (s *Server) handleOpenAITextChatCompletion(c *gin.Context, req chatCompleti
 			"metadata": result.Metadata,
 		},
 	})
+}
+
+func (s *Server) handleOpenAIStreamingTextChatCompletion(c *gin.Context, modelSpec browserModelSpec, prompt string, textMessages []textJobMessage, created int64, completionID string, start time.Time, ctx context.Context) {
+	job, waiter := s.textJobBridge.enqueue(modelSpec.SiteID, prompt, modelSpec.ID, textMessages)
+	chunkCh, _ := s.textJobBridge.chunkChannel(job.ID)
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	writeSSEJSON(c, gin.H{
+		"id":      completionID,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   modelSpec.ID,
+		"choices": []gin.H{{
+			"index": 0,
+			"delta": gin.H{
+				"role": "assistant",
+			},
+			"finish_reason": nil,
+		}},
+	})
+
+	sentContent := ""
+	writeContentDelta := func(content string) {
+		if strings.TrimSpace(content) == "" || content == sentContent {
+			return
+		}
+		delta := ""
+		if strings.HasPrefix(content, sentContent) {
+			delta = strings.TrimPrefix(content, sentContent)
+		} else {
+			delta = content
+		}
+		if delta == "" {
+			return
+		}
+		sentContent = content
+		writeSSEJSON(c, gin.H{
+			"id":      completionID,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   modelSpec.ID,
+			"choices": []gin.H{{
+				"index": 0,
+				"delta": gin.H{
+					"content": delta,
+				},
+				"finish_reason": nil,
+			}},
+		})
+	}
+
+	for {
+		select {
+		case chunk, ok := <-chunkCh:
+			if !ok {
+				chunkCh = nil
+				continue
+			}
+			if chunk != nil {
+				writeContentDelta(chunk.Content)
+			}
+		case result := <-waiter:
+			if result == nil {
+				log.Printf("[OpenLink][OpenAI] streaming text completion nil result completion_id=%s model=%s site=%s job=%s duration=%s", completionID, modelSpec.ID, modelSpec.SiteID, job.ID, time.Since(start).Round(time.Millisecond))
+				writeSSETextDone(c, completionID, modelSpec.ID, created)
+				return
+			}
+			if strings.TrimSpace(result.Error) != "" {
+				log.Printf("[OpenLink][OpenAI] streaming text completion error completion_id=%s model=%s site=%s job=%s duration=%s err=%q metadata=%v", completionID, modelSpec.ID, modelSpec.SiteID, job.ID, time.Since(start).Round(time.Millisecond), result.Error, result.Metadata)
+				writeSSEJSON(c, gin.H{"error": result.Error})
+				writeSSETextDone(c, completionID, modelSpec.ID, created)
+				return
+			}
+			writeContentDelta(result.Content)
+			log.Printf("[OpenLink][OpenAI] streaming text completion success completion_id=%s model=%s site=%s job=%s duration=%s content_len=%d metadata=%v", completionID, modelSpec.ID, modelSpec.SiteID, job.ID, time.Since(start).Round(time.Millisecond), len(result.Content), result.Metadata)
+			writeSSETextDone(c, completionID, modelSpec.ID, created)
+			return
+		case <-ctx.Done():
+			s.textJobBridge.remove(job.ID)
+			log.Printf("[OpenLink][OpenAI] streaming text completion failed completion_id=%s model=%s site=%s job=%s duration=%s err=%v", completionID, modelSpec.ID, modelSpec.SiteID, job.ID, time.Since(start).Round(time.Millisecond), ctx.Err())
+			writeSSEJSON(c, gin.H{"error": "browser text completion timed out", "details": ctx.Err().Error()})
+			writeSSETextDone(c, completionID, modelSpec.ID, created)
+			return
+		case <-c.Request.Context().Done():
+			s.textJobBridge.remove(job.ID)
+			return
+		}
+	}
+}
+
+func writeSSETextDone(c *gin.Context, completionID, model string, created int64) {
+	writeSSEJSON(c, gin.H{
+		"id":      completionID,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []gin.H{{
+			"index":         0,
+			"delta":         gin.H{},
+			"finish_reason": "stop",
+		}},
+	})
+	_, _ = c.Writer.Write([]byte("data: [DONE]\n\n"))
+	c.Writer.Flush()
 }
 
 func extractTextJobMessages(messages []chatCompletionMessage) []textJobMessage {

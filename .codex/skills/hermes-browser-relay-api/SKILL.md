@@ -1,9 +1,6 @@
 ---
 name: hermes-browser-relay-api
-description: Use the user's local Hermes browser relay directly over HTTP with Bearer auth to control a real attached browser tab.
-version: 1.0.0
-author: Hermes Agent
-license: MIT
+description: Use the user's local Hermes browser relay directly over HTTP with Bearer auth to control a real attached browser tab, including compact composite action/snapshot endpoints such as click-and-snapshot, type-and-snapshot, press-and-snapshot, and /action to reduce round trips and token-heavy page snapshots.
 ---
 
 # Hermes browser relay API
@@ -50,7 +47,8 @@ If `/json/list` is empty, the browser extension has not attached a tab yet.
 1. Get the active attached session ID from `/json/list`.
 2. Call the session endpoints with Bearer auth.
 3. Use `snapshot` first to inspect refs before click/type.
-4. Re-snapshot after each interaction that changes the page.
+4. Prefer composite endpoints for state-changing interactions so the relay performs the action, waits for page stability, and returns a compact snapshot in one call.
+5. Re-snapshot manually only when you intentionally need separate observation from action.
 
 ## Fast path: default routine for attached real-browser tasks
 
@@ -62,8 +60,9 @@ Use this default sequence directly:
 2. `GET /json/version` to verify relay is alive.
 3. `GET /json/list` and pick the first attached page session unless the user specified another tab.
 4. `GET /sessions/:sessionId/snapshot` once to confirm page identity.
-5. Use the page-specific routine skill if one exists (for Grok, use `grok-relay-page-control`).
-6. Only inspect relay source code or old sessions if one of these is true:
+5. For state-changing work, use `/click-and-snapshot`, `/type-and-snapshot`, `/press-and-snapshot`, or `/action` instead of separate action + snapshot calls.
+6. Use the page-specific routine skill if one exists (for Grok, use `grok-relay-page-control`).
+7. Only inspect relay source code or old sessions if one of these is true:
    - `/json/version` or `/json/list` fails unexpectedly
    - the page-specific routine no longer works
    - the relay response shape changed
@@ -134,7 +133,7 @@ curl -s -X POST \
   -H 'Authorization: Bearer dev-token' \
   -H 'Content-Type: application/json' \
   http://127.0.0.1:18792/sessions/SESSION_ID/type \
-  -d '{"ref":"e21","text":"你好"}'
+  -d '{"ref":"e21","text":"hello"}'
 ```
 
 Press key:
@@ -146,6 +145,49 @@ curl -s -X POST \
   -d '{"key":"Enter"}'
 ```
 
+Click and compact snapshot:
+```bash
+curl -s -X POST \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  http://127.0.0.1:18792/sessions/SESSION_ID/click-and-snapshot \
+  -d '{"ref":"e15","wait":{"quietMs":250,"timeoutMs":3000},"snapshot":{"maxText":2000,"maxElements":50}}'
+```
+
+Type and compact snapshot:
+```bash
+curl -s -X POST \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  http://127.0.0.1:18792/sessions/SESSION_ID/type-and-snapshot \
+  -d '{"ref":"e21","text":"hello","clear":true,"wait":{"quietMs":250,"timeoutMs":3000},"snapshot":{"maxText":2000,"maxElements":50}}'
+```
+
+Press and compact snapshot:
+```bash
+curl -s -X POST \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  http://127.0.0.1:18792/sessions/SESSION_ID/press-and-snapshot \
+  -d '{"key":"Enter","wait":{"quietMs":250,"timeoutMs":3000},"snapshot":{"maxText":2000,"maxElements":50}}'
+```
+
+Batch several steps:
+```bash
+curl -s -X POST \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  http://127.0.0.1:18792/sessions/SESSION_ID/action \
+  -d '{"steps":[{"type":"type","ref":"e21","text":"hello","clear":true},{"type":"press","key":"Enter"},{"type":"waitStable","quietMs":250,"timeoutMs":3000},{"type":"snapshot","maxText":2000,"maxElements":50}]}'
+```
+
+Composite response notes:
+- `/click-and-snapshot`, `/type-and-snapshot`, and `/press-and-snapshot` return `{ ok, action, wait, snapshot }`.
+- `action.value` is the unwrapped CDP value when available, for example `true`.
+- `wait` is the unwrapped stable-wait result, for example `{ "reason": "stable", ... }`.
+- `snapshot.maxText` and `snapshot.maxElements` cap returned page text and element count to reduce token use.
+- Set `"wait": false` when the action should not wait before snapshot.
+
 ## Practical notes
 
 - Prefer `terminal` for curl-based relay control.
@@ -153,6 +195,8 @@ curl -s -X POST \
 - The relay session is the user's real browser tab, so actions can have real external effects. Be cautious.
 - For purchases, logins, or irreversible external actions, do not proceed without clear user intent.
 - For unfamiliar pages, exploratory scripting and DOM inspection are acceptable at first.
+- Prefer composite endpoints after the first snapshot. This avoids repeating large page snapshots and reduces AI token use.
+- Use `/action` for short deterministic flows such as type -> press -> waitStable -> snapshot. Keep long waits out of one huge `Runtime.evaluate`; use explicit `waitStable` or repeated short probes.
 - Once a control path succeeds on a page or task, stop re-exploring from scratch: turn the successful sequence into a fixed reusable routine (stable selectors, submit path, page-specific quirks, verification steps) and use that routine on subsequent runs.
 - Prefer accumulating page/task-specific successful patterns into dedicated skills or helper scripts instead of re-writing ad hoc one-off probes every time.
 - On some modern apps, the relay `snapshot` can expose a hidden `textarea` while the real visible editor is a `contenteditable` node. Do not assume the `textarea` is the true input surface.
@@ -172,4 +216,4 @@ curl -s -X POST \
 - `/json/list` returns at least one attached page.
 - You used the listed `session-...` ID for all calls.
 - You inspected `snapshot` before interacting.
-- You re-snapshotted after state-changing actions.
+- You used a composite action/snapshot endpoint for state-changing actions, or deliberately chose a separate action and snapshot.

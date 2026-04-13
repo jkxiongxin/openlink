@@ -18,6 +18,8 @@ Use this skill to avoid selector guessing. First operate the real browser page t
    - Take one `/sessions/:id/snapshot` to confirm page identity.
 
 2. Build a real-page trace before editing OpenLink.
+   - After the initial snapshot, prefer `$hermes-browser-relay-api` composite endpoints for state-changing actions: `/click-and-snapshot`, `/type-and-snapshot`, `/press-and-snapshot`, or `/action`.
+   - Use `snapshot.maxText` and `snapshot.maxElements` in composite calls to keep the returned observation compact.
    - Prefer short CDP `Runtime.evaluate` probes with `returnByValue: true`.
    - Inspect the visible editor, active element, send button, upload controls, tool/mode chips, pending/stop button, response containers, generated-media containers, and network-observed URLs.
    - Do not trust hidden textareas or inner editor nodes; verify geometry and visibility with `getBoundingClientRect()` and computed style.
@@ -28,7 +30,8 @@ Use this skill to avoid selector guessing. First operate the real browser page t
    - Use positive conditions, not just elapsed time.
    - For attachments, require visible preview, real remove/cancel control, closed menu, and a stable state window.
    - For generated media, distinguish uploaded preview images from generated outputs by container, alt text, size, and whether the image is inside the input area.
-   - For long operations, poll in short CDP calls; relay long `Runtime.evaluate` calls can fail with HTTP 500.
+   - For ordinary click/type/press flows, use composite relay calls with `wait: { "quietMs": 250, "timeoutMs": 3000 }` and inspect the returned `wait.reason` plus `snapshot`.
+   - For long operations, poll in short CDP calls or short `/action` batches; relay long `Runtime.evaluate` calls can fail with HTTP 500.
 
 4. Translate the trace to OpenLink.
    - Put site-specific browser behavior in the site adapter or adjacent site-specific helpers in `extension/src/content/index.ts`.
@@ -41,7 +44,34 @@ Use this skill to avoid selector guessing. First operate the real browser page t
    - Rebuild with `cd extension && npm run build`.
    - Reload `extension/dist/`.
    - Run a real job once with debug mode enabled.
-   - If it fails, use the new logs to decide which state condition was wrong, then re-check the real page with relay before patching again.
+   - If it fails, use the new logs to decide which state condition was wrong, then re-check the real page with a compact composite relay call before patching again.
+
+## Relay Composite Pattern
+
+Use this pattern when proving a page interaction before coding it into OpenLink:
+
+```json
+{
+  "ref": "e15",
+  "wait": { "quietMs": 250, "timeoutMs": 3000 },
+  "snapshot": { "maxText": 2000, "maxElements": 50 }
+}
+```
+
+For multi-step flows, prefer one `/action` call:
+
+```json
+{
+  "steps": [
+    { "type": "type", "ref": "e21", "text": "hello", "clear": true },
+    { "type": "press", "key": "Enter" },
+    { "type": "waitStable", "quietMs": 250, "timeoutMs": 3000 },
+    { "type": "snapshot", "maxText": 2000, "maxElements": 50 }
+  ]
+}
+```
+
+Record the successful sequence as: initial snapshot refs, action steps, stable-wait reason, compact returned snapshot, and any CDP probe that proved a site-specific selector.
 
 ## Gemini Lesson Learned
 
