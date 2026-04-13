@@ -5,8 +5,10 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -26,6 +28,7 @@ type Server struct {
 	router         *gin.Engine
 	executor       *executor.Executor
 	imageJobBridge *imageJobBridge
+	textJobBridge  *textJobBridge
 }
 
 func New(config *types.Config) *Server {
@@ -37,6 +40,7 @@ func New(config *types.Config) *Server {
 		router:         router,
 		executor:       executor.New(config),
 		imageJobBridge: newImageJobBridge(config.RootDir, config.Token),
+		textJobBridge:  newTextJobBridge(),
 	}
 
 	s.setupRoutes()
@@ -67,9 +71,12 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/files", s.handleListFiles)
 	s.router.GET("/bridge/image-jobs/next", s.handleImageJobNext)
 	s.router.POST("/bridge/image-jobs/:id/result", s.handleImageJobResult)
+	s.router.GET("/bridge/text-jobs/next", s.handleTextJobNext)
+	s.router.POST("/bridge/text-jobs/:id/result", s.handleTextJobResult)
 	s.router.GET("/v1/models", s.handleOpenAIModels)
 	s.router.POST("/v1/chat/completions", s.handleOpenAIChatCompletions)
 	s.router.POST("/v1/images/generations", s.handleOpenAIImageGeneration)
+	s.router.POST("/v1/images/edits", s.handleOpenAIImageEdit)
 	s.router.GET("/generated/*path", s.handleGeneratedAsset)
 }
 
@@ -313,6 +320,197 @@ func (s *Server) handleOpenAIImageGeneration(c *gin.Context) {
 	})
 }
 
+func (s *Server) handleOpenAIImageEdit(c *gin.Context) {
+	req, err := parseOpenAIImageEditRequest(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request", "details": err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.Prompt) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "prompt is required"})
+		return
+	}
+	if len(normalizeReferenceImageInputs(req.ReferenceImages, req.Image, req.Images)) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "image is required"})
+		return
+	}
+	if req.ResponseFormat == "" {
+		req.ResponseFormat = "url"
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), s.openAITimeout())
+	defer cancel()
+
+	model := normalizeOpenAIModel(req.Model)
+	referenceInputs := normalizeReferenceImageInputs(req.ReferenceImages, req.Image, req.Images)
+	if req.Mask != nil {
+		referenceInputs = append(referenceInputs, *req.Mask)
+	}
+	referenceImages, err := resolveReferenceImages(ctx, s.config.RootDir, referenceInputs)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid reference images", "details": err.Error()})
+		return
+	}
+
+	job, result, err := s.imageJobBridge.enqueueAndWait(ctx, openAIModelSite(model), "image", req.Prompt, model, req.Size, req.ResponseFormat, referenceImages)
+	if err != nil {
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "image edit timed out", "details": err.Error()})
+		return
+	}
+
+	url := buildGeneratedAssetURL(c, result.StoredRelPath, s.config.Token)
+	item := gin.H{
+		"url":            url,
+		"revised_prompt": job.Prompt,
+	}
+	if req.ResponseFormat == "b64_json" || req.ResponseFormat == "url+b64_json" {
+		item["b64_json"] = base64.StdEncoding.EncodeToString(result.Data)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"created": time.Now().Unix(),
+		"data":    []gin.H{item},
+	})
+}
+
+type openAIImageEditRequest struct {
+	Prompt          string
+	Model           string
+	Size            string
+	ResponseFormat  string
+	Image           referenceImageInputs
+	Images          referenceImageInputs
+	ReferenceImages referenceImageInputs
+	Mask            *referenceImageInput
+}
+
+func parseOpenAIImageEditRequest(c *gin.Context) (openAIImageEditRequest, error) {
+	contentType := strings.ToLower(c.GetHeader("Content-Type"))
+	if strings.Contains(contentType, "multipart/form-data") {
+		return parseOpenAIImageEditMultipartRequest(c)
+	}
+
+	var raw struct {
+		Prompt          string               `json:"prompt"`
+		Model           string               `json:"model"`
+		Size            string               `json:"size"`
+		ResponseFormat  string               `json:"response_format"`
+		Image           referenceImageInputs `json:"image"`
+		Images          referenceImageInputs `json:"images"`
+		ReferenceImages referenceImageInputs `json:"reference_images"`
+		Mask            referenceImageInputs `json:"mask"`
+	}
+	if err := c.ShouldBindJSON(&raw); err != nil {
+		return openAIImageEditRequest{}, err
+	}
+
+	req := openAIImageEditRequest{
+		Prompt:          raw.Prompt,
+		Model:           raw.Model,
+		Size:            raw.Size,
+		ResponseFormat:  raw.ResponseFormat,
+		Image:           raw.Image,
+		Images:          raw.Images,
+		ReferenceImages: raw.ReferenceImages,
+	}
+	maskItems := normalizeReferenceImageInputs(raw.Mask)
+	if len(maskItems) > 0 {
+		req.Mask = &maskItems[0]
+	}
+	return req, nil
+}
+
+func parseOpenAIImageEditMultipartRequest(c *gin.Context) (openAIImageEditRequest, error) {
+	if err := c.Request.ParseMultipartForm(maxReferenceImageBytes * 4); err != nil {
+		return openAIImageEditRequest{}, err
+	}
+	form := c.Request.MultipartForm
+	if form == nil {
+		return openAIImageEditRequest{}, fmt.Errorf("multipart form is empty")
+	}
+
+	req := openAIImageEditRequest{
+		Prompt:         firstFormValue(form, "prompt"),
+		Model:          firstFormValue(form, "model"),
+		Size:           firstFormValue(form, "size"),
+		ResponseFormat: firstFormValue(form, "response_format"),
+	}
+
+	for _, field := range []string{"image", "images", "image[]", "images[]"} {
+		refs, err := referenceInputsFromMultipartFiles(form.File[field])
+		if err != nil {
+			return openAIImageEditRequest{}, err
+		}
+		req.Image = append(req.Image, refs...)
+	}
+	for _, field := range []string{"reference_image", "reference_images", "reference_images[]"} {
+		refs, err := referenceInputsFromMultipartFiles(form.File[field])
+		if err != nil {
+			return openAIImageEditRequest{}, err
+		}
+		req.ReferenceImages = append(req.ReferenceImages, refs...)
+	}
+	maskRefs, err := referenceInputsFromMultipartFiles(form.File["mask"])
+	if err != nil {
+		return openAIImageEditRequest{}, err
+	}
+	if len(maskRefs) > 0 {
+		req.Mask = &maskRefs[0]
+	}
+	return req, nil
+}
+
+func firstFormValue(form *multipart.Form, key string) string {
+	if form == nil {
+		return ""
+	}
+	values := form.Value[key]
+	if len(values) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(values[0])
+}
+
+func referenceInputsFromMultipartFiles(files []*multipart.FileHeader) (referenceImageInputs, error) {
+	items := make(referenceImageInputs, 0, len(files))
+	for _, header := range files {
+		item, err := referenceInputFromMultipartFile(header)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func referenceInputFromMultipartFile(header *multipart.FileHeader) (referenceImageInput, error) {
+	if header == nil {
+		return referenceImageInput{}, fmt.Errorf("empty multipart file")
+	}
+	file, err := header.Open()
+	if err != nil {
+		return referenceImageInput{}, err
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, maxReferenceImageBytes+1))
+	if err != nil {
+		return referenceImageInput{}, err
+	}
+	if len(data) > maxReferenceImageBytes {
+		return referenceImageInput{}, fmt.Errorf("reference image too large (max %d bytes)", maxReferenceImageBytes)
+	}
+	mimeType := strings.TrimSpace(header.Header.Get("Content-Type"))
+	if mimeType == "" {
+		mimeType = http.DetectContentType(data)
+	}
+	return referenceImageInput{
+		Data:     base64.StdEncoding.EncodeToString(data),
+		MimeType: mimeType,
+		FileName: header.Filename,
+	}, nil
+}
+
 func (s *Server) openAITimeout() time.Duration {
 	const minOpenAITimeout = 10 * time.Minute
 	cfgTimeout := time.Duration(s.config.Timeout) * time.Second
@@ -336,6 +534,15 @@ func (s *Server) openAITimeoutForKind(mediaKind string) time.Duration {
 		return s.openAIVideoTimeout()
 	}
 	return s.openAITimeout()
+}
+
+func (s *Server) openAITextTimeout() time.Duration {
+	const minOpenAITextTimeout = 5 * time.Minute
+	cfgTimeout := time.Duration(s.config.Timeout) * time.Second
+	if cfgTimeout < minOpenAITextTimeout {
+		return minOpenAITextTimeout
+	}
+	return cfgTimeout
 }
 
 func (s *Server) handleImageJobNext(c *gin.Context) {
@@ -401,6 +608,53 @@ func (s *Server) handleImageJobResult(c *gin.Context) {
 		"ok":         true,
 		"path":       result.StoredRelPath,
 		"media_kind": result.MediaKind,
+	})
+}
+
+func (s *Server) handleTextJobNext(c *gin.Context) {
+	siteID := strings.TrimSpace(c.Query("site_id"))
+	job := s.textJobBridge.nextJob(siteID)
+	if job == nil {
+		c.JSON(http.StatusOK, gin.H{"job": nil})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"job": gin.H{
+			"id":         job.ID,
+			"site_id":    job.SiteID,
+			"prompt":     job.Prompt,
+			"model":      job.Model,
+			"messages":   job.Messages,
+			"created_at": job.CreatedAt.Unix(),
+		},
+	})
+}
+
+func (s *Server) handleTextJobResult(c *gin.Context) {
+	var req struct {
+		Content  string            `json:"content"`
+		Error    string            `json:"error"`
+		Metadata map[string]string `json:"metadata"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+		return
+	}
+	jobID := c.Param("id")
+	if strings.TrimSpace(req.Error) != "" {
+		s.textJobBridge.failWithError(jobID, req.Error)
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+		return
+	}
+	result, err := s.textJobBridge.complete(jobID, req.Content, req.Metadata)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":       true,
+		"length":   len(result.Content),
+		"metadata": result.Metadata,
 	})
 }
 

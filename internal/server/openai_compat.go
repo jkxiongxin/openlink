@@ -17,21 +17,12 @@ type openAIModelInfo struct {
 	Object      string `json:"object"`
 	OwnedBy     string `json:"owned_by"`
 	Description string `json:"description,omitempty"`
+	Capability  string `json:"capability,omitempty"`
+	SiteID      string `json:"site_id,omitempty"`
+	MediaKind   string `json:"media_kind,omitempty"`
 }
 
-var openAIModelCatalog = []openAIModelInfo{
-	{ID: "labs-google-fx", Object: "model", OwnedBy: "openlink", Description: "Google Labs Flow image generation via browser automation"},
-	{ID: "labs-google-fx-image", Object: "model", OwnedBy: "openlink", Description: "Alias of labs-google-fx for image generation"},
-	{ID: "labs-google-fx-video", Object: "model", OwnedBy: "openlink", Description: "Google Labs Flow video generation via browser automation"},
-	{ID: "labs-google-fx-video-reference", Object: "model", OwnedBy: "openlink", Description: "Google Labs Flow reference-image video generation via browser automation"},
-	{ID: "labs-google-fx-video-start-end", Object: "model", OwnedBy: "openlink", Description: "Google Labs Flow start/end-frame video generation via browser automation"},
-	{ID: "labs-google-fx-veo", Object: "model", OwnedBy: "openlink", Description: "Alias of labs-google-fx-video for video generation"},
-	{ID: "labs-google-fx-veo-reference", Object: "model", OwnedBy: "openlink", Description: "Alias of labs-google-fx-video-reference for reference-image video generation"},
-	{ID: "labs-google-fx-veo-start-end", Object: "model", OwnedBy: "openlink", Description: "Alias of labs-google-fx-video-start-end for start/end-frame video generation"},
-	{ID: "gemini-2.0-flash-preview-image-generation", Object: "model", OwnedBy: "openlink", Description: "Gemini image generation via browser automation"},
-	{ID: "gemini-2.5-flash-image-preview", Object: "model", OwnedBy: "openlink", Description: "Gemini image generation via browser automation"},
-	{ID: "gemini-image", Object: "model", OwnedBy: "openlink", Description: "Alias of Gemini browser image generation"},
-}
+var openAIModelCatalog = buildOpenAIModelCatalog()
 
 var markdownImageURLRe = regexp.MustCompile(`!\[[^\]]*\]\(([^)\s]+)`)
 var htmlVideoURLRe = regexp.MustCompile(`(?i)<video[^>]+src=['"]([^'"]+)`)
@@ -69,8 +60,22 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 		return
 	}
 
+	created := time.Now().Unix()
+	completionID := fmt.Sprintf("chatcmpl-%d", created)
 	model := normalizeOpenAIModel(req.Model)
+	modelSpec, modelFound := lookupBrowserModel(req.Model)
+	if !modelFound && isStructuredBrowserModelID(req.Model) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported browser model", "model": req.Model})
+		return
+	}
+	if modelFound && modelSpec.Capability == modelCapabilityText {
+		s.handleOpenAITextChatCompletion(c, req, modelSpec, prompt, created, completionID)
+		return
+	}
 	mediaKind := openAIModelKind(model)
+	if modelFound && modelSpec.MediaKind != "" {
+		mediaKind = modelSpec.MediaKind
+	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), s.openAITimeoutForKind(mediaKind))
 	defer cancel()
 
@@ -80,9 +85,6 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid reference images", "details": err.Error()})
 		return
 	}
-
-	created := time.Now().Unix()
-	completionID := fmt.Sprintf("chatcmpl-%d", created)
 
 	if req.Stream {
 		job, waiter := s.imageJobBridge.enqueue(openAIModelSite(model), mediaKind, prompt, model, "", "url", referenceImages)
@@ -208,6 +210,93 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 		"revised_prompt": job.Prompt,
 		"url":            mediaURL,
 	})
+}
+
+func (s *Server) handleOpenAITextChatCompletion(c *gin.Context, req chatCompletionRequest, modelSpec browserModelSpec, prompt string, created int64, completionID string) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), s.openAITextTimeout())
+	defer cancel()
+
+	job, result, err := s.textJobBridge.enqueueAndWait(ctx, modelSpec.SiteID, prompt, modelSpec.ID, extractTextJobMessages(req.Messages))
+	if err != nil {
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "browser text completion timed out", "details": err.Error()})
+		return
+	}
+
+	if req.Stream {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("X-Accel-Buffering", "no")
+		writeSSEJSON(c, gin.H{
+			"id":      completionID,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   modelSpec.ID,
+			"choices": []gin.H{{
+				"index": 0,
+				"delta": gin.H{
+					"role": "assistant",
+				},
+				"finish_reason": nil,
+			}},
+		})
+		writeSSEJSON(c, gin.H{
+			"id":      completionID,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   modelSpec.ID,
+			"choices": []gin.H{{
+				"index": 0,
+				"delta": gin.H{
+					"content": result.Content,
+				},
+				"finish_reason": "stop",
+			}},
+		})
+		_, _ = c.Writer.Write([]byte("data: [DONE]\n\n"))
+		c.Writer.Flush()
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":      completionID,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   modelSpec.ID,
+		"choices": []gin.H{{
+			"index": 0,
+			"message": gin.H{
+				"role":    "assistant",
+				"content": result.Content,
+			},
+			"finish_reason": "stop",
+		}},
+		"usage": gin.H{
+			"prompt_tokens":     0,
+			"completion_tokens": 0,
+			"total_tokens":      0,
+		},
+		"openlink": gin.H{
+			"job_id":   job.ID,
+			"site_id":  job.SiteID,
+			"metadata": result.Metadata,
+		},
+	})
+}
+
+func extractTextJobMessages(messages []chatCompletionMessage) []textJobMessage {
+	items := make([]textJobMessage, 0, len(messages))
+	for _, msg := range messages {
+		content := strings.TrimSpace(extractTextFromChatContent(msg.Content))
+		if content == "" {
+			continue
+		}
+		items = append(items, textJobMessage{
+			Role:    strings.TrimSpace(msg.Role),
+			Content: content,
+		})
+	}
+	return items
 }
 
 func extractPromptAndReferencesFromMessages(messages []chatCompletionMessage) (string, []referenceImageInput) {
@@ -366,21 +455,10 @@ func appendHistoricalAssistantReferenceImages(references []referenceImageInput, 
 }
 
 func normalizeOpenAIModel(model string) string {
-	model = strings.TrimSpace(model)
-	switch model {
-	case "", "labs-google-fx-image":
-		return "labs-google-fx"
-	case "labs-google-fx-veo":
-		return "labs-google-fx-video"
-	case "labs-google-fx-veo-reference":
-		return "labs-google-fx-video-reference"
-	case "labs-google-fx-veo-start-end":
-		return "labs-google-fx-video-start-end"
-	case "gemini-image":
-		return "gemini-2.0-flash-preview-image-generation"
-	default:
-		return model
+	if spec, ok := lookupBrowserModel(model); ok {
+		return spec.ID
 	}
+	return strings.TrimSpace(model)
 }
 
 func openAIModelKind(model string) string {
@@ -395,6 +473,12 @@ func openAIModelSite(model string) string {
 	normalized := strings.ToLower(strings.TrimSpace(model))
 	if strings.Contains(normalized, "gemini") {
 		return "gemini"
+	}
+	if strings.Contains(normalized, "chatgpt") || strings.Contains(normalized, "op-gpt-image") {
+		return "chatgpt"
+	}
+	if strings.Contains(normalized, "qwen") {
+		return "qwen"
 	}
 	return "labsfx"
 }

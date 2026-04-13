@@ -367,7 +367,7 @@ const siteAdapters: SiteAdapter[] = [
   },
   {
     id: 'gemini',
-    matches: () => location.hostname.includes('gemini.google.com'),
+    matches: () => location.hostname.includes('gemini.google.com') || location.hostname.includes('aistudio.google.com'),
     config: {
       editor: 'div.ql-editor[contenteditable="true"]',
       sendBtn: 'button.send-button[aria-label*="发送"], button.send-button[aria-label*="Send"]',
@@ -394,6 +394,57 @@ const siteAdapters: SiteAdapter[] = [
         }
       }
       return querySelectorFirst(sendBtnSel);
+    },
+  },
+  {
+    id: 'chatgpt',
+    matches: () => location.hostname === 'chatgpt.com' || location.hostname.endsWith('.chatgpt.com'),
+    config: {
+      editor: '#prompt-textarea.ProseMirror[contenteditable="true"], div.ProseMirror[contenteditable="true"][role="textbox"], #prompt-textarea',
+      sendBtn: 'button[aria-label="发送提示"], button[aria-label*="Send"], button[data-testid="send-button"]',
+      stopBtn: 'button[aria-label*="停止"], button[aria-label*="Stop"], button[data-testid="stop-button"]',
+      fillMethod: 'prosemirror',
+      useObserver: true,
+      responseSelector: '[data-message-author-role="assistant"] .markdown, [data-message-author-role="assistant"], article',
+    },
+    getConversationId() {
+      const m = location.pathname.match(/\/c\/([^/?#]+)/);
+      return m ? m[1] : defaultConversationId();
+    },
+    getSourceKey(sourceEl) {
+      const message = sourceEl?.closest('[data-message-id], [data-message-author-role="assistant"]');
+      const id = message?.getAttribute('data-message-id');
+      if (id) return id;
+      return defaultSourceKey(sourceEl);
+    },
+    isAssistantResponse(el) {
+      if (!el) return false;
+      const message = el.closest('[data-message-author-role]');
+      return message?.getAttribute('data-message-author-role') === 'assistant';
+    },
+    shouldRenderToolText(text, sourceEl) {
+      if (sourceEl?.closest('pre, code')) return false;
+      return text.replace(/\s+/g, ' ').includes('<tool');
+    },
+    getToolCardMount(sourceEl) {
+      const message = sourceEl.closest('[data-message-author-role="assistant"]');
+      if (message) return { anchor: message, before: message.lastElementChild };
+      return defaultToolMount(sourceEl);
+    },
+    getEditorRegion(editor) {
+      if (!editor) return null;
+      return editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor);
+    },
+    getSendButton(editor, sendBtnSel) {
+      const region = (editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor)) as Element | null;
+      if (region) {
+        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
+          const btn = region.querySelector<HTMLElement>(sel);
+          if (btn && isVisibleElement(btn) && !(btn as HTMLButtonElement).disabled) return btn;
+        }
+      }
+      const globalBtn = querySelectorFirst(sendBtnSel);
+      return globalBtn && isVisibleElement(globalBtn) && !(globalBtn as HTMLButtonElement).disabled ? globalBtn : null;
     },
   },
   {
@@ -600,6 +651,19 @@ if (!(window as any).__OPENLINK_LOADED__) {
   } else if (location.hostname.includes('gemini.google.com')) {
     if (document.body) startGeminiImageWorker();
     else document.addEventListener('DOMContentLoaded', startGeminiImageWorker);
+  } else if (location.hostname === 'chatgpt.com' || location.hostname.endsWith('.chatgpt.com')) {
+    if (document.body) startChatGPTImageWorker();
+    else document.addEventListener('DOMContentLoaded', startChatGPTImageWorker);
+  } else if (location.hostname === 'chat.qwen.ai') {
+    if (document.body) startQwenImageWorker();
+    else document.addEventListener('DOMContentLoaded', startQwenImageWorker);
+  }
+
+  const textWorkerSiteID = getBrowserTextWorkerSiteID();
+  if (textWorkerSiteID) {
+    const start = () => startBrowserTextWorker(textWorkerSiteID);
+    if (document.body) start();
+    else document.addEventListener('DOMContentLoaded', start);
   }
 }
 
@@ -1412,6 +1476,955 @@ async function runGeminiImageJob(job: any, apiUrl: string, authToken: string) {
   } finally {
     window.postMessage({ type: 'OPENLINK_SET_GEMINI_MEDIA_CAPTURE', data: { active: false } }, '*');
   }
+}
+
+function startChatGPTImageWorker() {
+  let running = false;
+  let stopped = false;
+  debugLog('chatgpt 图片 worker 已启动');
+
+  const tick = async () => {
+    if (running || stopped || extensionContextInvalidated) return;
+    running = true;
+    try {
+      const { authToken, apiUrl } = await getStoredConfig(['authToken', 'apiUrl']);
+      if (!authToken || !apiUrl) {
+        debugLog('chatgpt 跳过轮询，缺少配置', { hasAuthToken: !!authToken, hasApiUrl: !!apiUrl });
+        return;
+      }
+      const headers: Record<string, string> = { Authorization: `Bearer ${authToken}` };
+      const resp = await bgFetch(`${apiUrl}/bridge/image-jobs/next?site_id=chatgpt`, { headers });
+      if (!resp.ok) {
+        debugLog('chatgpt 拉取任务失败', { status: resp.status });
+        return;
+      }
+      const payload = JSON.parse(resp.body || '{}');
+      const job = payload.job;
+      if (!job?.id || !job?.prompt) return;
+      debugLog('chatgpt 收到媒体任务', {
+        id: job.id,
+        mediaKind: job.media_kind || 'image',
+        prompt: String(job.prompt).slice(0, 120),
+      });
+      try {
+        await runChatGPTImageJob(job, apiUrl, authToken);
+      } catch (err) {
+        debugLog('chatgpt 任务执行失败，准备回传错误', { id: job.id, error: err instanceof Error ? err.message : String(err) });
+        await bgFetch(`${apiUrl}/bridge/image-jobs/${encodeURIComponent(job.id)}/result`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+        });
+        throw err;
+      }
+    } catch (err) {
+      handleExtensionContextError(err);
+      if (extensionContextInvalidated) {
+        stopped = true;
+        return;
+      }
+      console.warn('[OpenLink] chatgpt image worker error:', err);
+      debugLog('chatgpt worker 异常', err instanceof Error ? err.message : String(err));
+    } finally {
+      running = false;
+    }
+  };
+
+  void tick();
+  const intervalId = window.setInterval(() => {
+    if (stopped || extensionContextInvalidated) {
+      window.clearInterval(intervalId);
+      return;
+    }
+    void tick();
+  }, 2500);
+}
+
+async function runChatGPTImageJob(job: any, apiUrl: string, authToken: string) {
+  const mediaKind = String(job.media_kind || 'image');
+  if (mediaKind !== 'image') throw new Error(`chatgpt unsupported media kind: ${mediaKind}`);
+
+  const referenceImages = Array.isArray(job.reference_images) ? job.reference_images : [];
+  showToast(`ChatGPT 开始处理图片: ${job.id}`, 2500);
+  debugLog('chatgpt 开始执行图片任务', { id: job.id, referenceCount: referenceImages.length });
+
+  const editor = await waitForElement<HTMLElement>('#prompt-textarea.ProseMirror[contenteditable="true"], div.ProseMirror[contenteditable="true"][role="textbox"], #prompt-textarea', 20000);
+  debugLog('chatgpt 已定位输入框');
+  await clearChatGPTComposerAttachments(editor);
+  debugLog('chatgpt 已清理旧参考图', { remaining: getChatGPTComposerAttachmentCount(editor) });
+
+  if (referenceImages.length > 0) {
+    await attachChatGPTReferenceImages(editor, referenceImages, apiUrl, authToken);
+  } else {
+    debugLog('chatgpt 本次任务无参考图');
+  }
+
+  const beforeKeys = getChatGPTImageKeys();
+  debugLog('chatgpt 提交前图片 key 集合', beforeKeys);
+
+  await setChatGPTPrompt(editor, String(job.prompt));
+  debugLog('chatgpt Prompt 已写入', { prompt: String(job.prompt).slice(0, 120), editorText: getEditorText(editor).slice(0, 120) });
+
+  const sendBtn = await waitForChatGPTSendButton(editor, 90000);
+  if (!sendBtn) throw new Error('chatgpt send button not found');
+  debugLog('chatgpt 已定位发送按钮', {
+    ariaLabel: sendBtn.getAttribute('aria-label') || '',
+    text: (sendBtn.textContent || '').trim().slice(0, 60),
+  });
+  await clickElementLikeUser(sendBtn);
+  debugLog('chatgpt 已触发发送按钮点击');
+
+  const imageEl = await waitForNewChatGPTImage(beforeKeys, 240000);
+  const imageSrc = imageEl.currentSrc || imageEl.getAttribute('src') || '';
+  if (!imageSrc) throw new Error('chatgpt generated image src missing');
+  debugLog('chatgpt 检测到新图片', { src: imageSrc, alt: imageEl.getAttribute('alt') || '' });
+
+  const absoluteURL = new URL(imageSrc, location.href).toString();
+  const imageResp = await bgFetchBinary(absoluteURL, {
+    credentials: 'include',
+    redirect: 'follow',
+    referrer: 'https://chatgpt.com/',
+  });
+  if (!imageResp.ok || !imageResp.bodyBase64) {
+    throw new Error(`chatgpt image fetch failed: ${imageResp.error || `HTTP ${imageResp.status}`}`);
+  }
+  const mimeType = imageResp.contentType || 'image/png';
+  const finalUrl = imageResp.finalUrl || absoluteURL;
+  const fileName = `${job.id}${guessMediaExtension(mimeType, finalUrl)}`;
+  debugLog('chatgpt 图片抓取成功', { status: imageResp.status, contentType: mimeType, finalUrl });
+
+  const resultResp = await bgFetch(`${apiUrl}/bridge/image-jobs/${encodeURIComponent(job.id)}/result`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${authToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      file_name: fileName,
+      mime_type: mimeType,
+      data: imageResp.bodyBase64,
+    }),
+  });
+  if (!resultResp.ok) throw new Error(`chatgpt image result upload failed: HTTP ${resultResp.status}`);
+  debugLog('chatgpt 图片结果回传成功', { fileName, status: resultResp.status });
+  showToast(`ChatGPT 图片已保存: ${fileName}`, 3500);
+}
+
+function startQwenImageWorker() {
+  let running = false;
+  let stopped = false;
+  debugLog('qwen 图片 worker 已启动');
+
+  const tick = async () => {
+    if (running || stopped || extensionContextInvalidated) return;
+    running = true;
+    try {
+      const { authToken, apiUrl } = await getStoredConfig(['authToken', 'apiUrl']);
+      if (!authToken || !apiUrl) {
+        debugLog('qwen 跳过轮询，缺少配置', { hasAuthToken: !!authToken, hasApiUrl: !!apiUrl });
+        return;
+      }
+      const headers: Record<string, string> = { Authorization: `Bearer ${authToken}` };
+      const resp = await bgFetch(`${apiUrl}/bridge/image-jobs/next?site_id=qwen`, { headers });
+      if (!resp.ok) {
+        debugLog('qwen 拉取任务失败', { status: resp.status });
+        return;
+      }
+      const payload = JSON.parse(resp.body || '{}');
+      const job = payload.job;
+      if (!job?.id || !job?.prompt) return;
+      debugLog('qwen 收到媒体任务', {
+        id: job.id,
+        mediaKind: job.media_kind || 'image',
+        prompt: String(job.prompt).slice(0, 120),
+      });
+      try {
+        await runQwenImageJob(job, apiUrl, authToken);
+      } catch (err) {
+        debugLog('qwen 任务执行失败，准备回传错误', { id: job.id, error: err instanceof Error ? err.message : String(err) });
+        await bgFetch(`${apiUrl}/bridge/image-jobs/${encodeURIComponent(job.id)}/result`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+        });
+        throw err;
+      }
+    } catch (err) {
+      handleExtensionContextError(err);
+      if (extensionContextInvalidated) {
+        stopped = true;
+        return;
+      }
+      console.warn('[OpenLink] qwen image worker error:', err);
+      debugLog('qwen worker 异常', err instanceof Error ? err.message : String(err));
+    } finally {
+      running = false;
+    }
+  };
+
+  void tick();
+  const intervalId = window.setInterval(() => {
+    if (stopped || extensionContextInvalidated) {
+      window.clearInterval(intervalId);
+      return;
+    }
+    void tick();
+  }, 2500);
+}
+
+async function runQwenImageJob(job: any, apiUrl: string, authToken: string) {
+  const mediaKind = String(job.media_kind || 'image');
+  if (mediaKind !== 'image') throw new Error(`qwen unsupported media kind: ${mediaKind}`);
+
+  const referenceImages = Array.isArray(job.reference_images) ? job.reference_images : [];
+  showToast(`Qwen 开始处理图片: ${job.id}`, 2500);
+  debugLog('qwen 开始执行图片任务', { id: job.id, referenceCount: referenceImages.length });
+
+  const editor = await waitForElement<HTMLTextAreaElement>('textarea.message-input-textarea, .message-input-container textarea', 20000);
+  debugLog('qwen 已定位输入框');
+  await clearQwenComposerAttachments(editor);
+  debugLog('qwen 已清理旧参考图', { remaining: getQwenComposerAttachmentCount(editor) });
+
+  if (referenceImages.length > 0) {
+    await attachQwenReferenceImages(editor, referenceImages, apiUrl, authToken);
+  } else {
+    debugLog('qwen 本次任务无参考图');
+  }
+
+  const beforeKeys = getQwenImageKeys();
+  debugLog('qwen 提交前图片 key 集合', beforeKeys);
+
+  setQwenPrompt(editor, String(job.prompt));
+  await sleep(250);
+  debugLog('qwen Prompt 已写入', { prompt: String(job.prompt).slice(0, 120), editorText: editor.value.slice(0, 120) });
+
+  const sendBtn = await waitForQwenSendButton(editor, 90000);
+  if (!sendBtn) throw new Error('qwen send button not found');
+  debugLog('qwen 已定位发送按钮', {
+    disabled: (sendBtn as HTMLButtonElement).disabled,
+    className: sendBtn.className,
+    text: (sendBtn.textContent || '').trim().slice(0, 60),
+  });
+  await clickElementLikeUser(sendBtn);
+  debugLog('qwen 已触发发送按钮点击');
+
+  const imageEl = await waitForNewQwenImage(beforeKeys, 300000);
+  const imageSrc = imageEl.currentSrc || imageEl.getAttribute('src') || '';
+  if (!imageSrc) throw new Error('qwen generated image src missing');
+  debugLog('qwen 检测到新图片', { src: imageSrc, alt: imageEl.getAttribute('alt') || '' });
+
+  const absoluteURL = new URL(imageSrc, location.href).toString();
+  const imageResp = await fetchQwenImageWithRetry(absoluteURL);
+  const mimeType = imageResp.contentType || 'image/png';
+  const finalUrl = imageResp.finalUrl || absoluteURL;
+  const fileName = `${job.id}${guessMediaExtension(mimeType, finalUrl)}`;
+  debugLog('qwen 图片抓取成功', { contentType: mimeType, finalUrl });
+
+  const resultResp = await bgFetch(`${apiUrl}/bridge/image-jobs/${encodeURIComponent(job.id)}/result`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${authToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      file_name: fileName,
+      mime_type: mimeType,
+      data: imageResp.bodyBase64,
+    }),
+  });
+  if (!resultResp.ok) throw new Error(`qwen image result upload failed: HTTP ${resultResp.status}`);
+  debugLog('qwen 图片结果回传成功', { fileName, status: resultResp.status });
+  showToast(`Qwen 图片已保存: ${fileName}`, 3500);
+}
+
+async function fetchQwenImageWithRetry(imageURL: string): Promise<{ bodyBase64: string; contentType: string; finalUrl: string }> {
+  const strategies = [
+    { name: 'omit', options: { credentials: 'omit', redirect: 'follow' } },
+    { name: 'include', options: { credentials: 'include', redirect: 'follow' } },
+    { name: 'default', options: { redirect: 'follow' } },
+  ] as const;
+  let lastError = 'unknown error';
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) await sleep(1000 * attempt);
+    for (const strategy of strategies) {
+      const resp = await bgFetchBinary(imageURL, strategy.options);
+      if (resp.ok && resp.bodyBase64) {
+        debugLog('qwen 图片抓取策略成功', {
+          attempt,
+          strategy: strategy.name,
+          status: resp.status,
+          contentType: resp.contentType,
+          finalUrl: resp.finalUrl,
+        });
+        return {
+          bodyBase64: resp.bodyBase64,
+          contentType: resp.contentType || 'image/png',
+          finalUrl: resp.finalUrl || imageURL,
+        };
+      }
+      lastError = resp.error || `HTTP ${resp.status}`;
+      debugLog('qwen 图片抓取策略失败', { attempt, strategy: strategy.name, error: lastError });
+    }
+  }
+  throw new Error(`qwen image fetch failed: ${lastError}`);
+}
+
+const browserTextWorkerSites = new Set(['gemini', 'chatgpt', 'qwen', 'deepseek', 'doubao']);
+const browserTextWorkerStarted = new Set<string>();
+
+function getBrowserTextWorkerSiteID(): string | null {
+  const siteID = getSiteAdapter().id;
+  return browserTextWorkerSites.has(siteID) ? siteID : null;
+}
+
+function startBrowserTextWorker(siteID: string) {
+  if (browserTextWorkerStarted.has(siteID)) return;
+  browserTextWorkerStarted.add(siteID);
+  let running = false;
+  let stopped = false;
+  debugLog('browser text worker 已启动', { siteID });
+
+  const tick = async () => {
+    if (running || stopped || extensionContextInvalidated) return;
+    running = true;
+    try {
+      const { authToken, apiUrl } = await getStoredConfig(['authToken', 'apiUrl']);
+      if (!authToken || !apiUrl) {
+        debugLog('text worker 跳过轮询，缺少配置', { siteID, hasAuthToken: !!authToken, hasApiUrl: !!apiUrl });
+        return;
+      }
+      const headers: Record<string, string> = { Authorization: `Bearer ${authToken}` };
+      const resp = await bgFetch(`${apiUrl}/bridge/text-jobs/next?site_id=${encodeURIComponent(siteID)}`, { headers });
+      if (!resp.ok) {
+        debugLog('text worker 拉取任务失败', { siteID, status: resp.status });
+        return;
+      }
+      const payload = JSON.parse(resp.body || '{}');
+      const job = payload.job;
+      if (!job?.id || !job?.prompt) return;
+      debugLog('text worker 收到任务', { siteID, id: job.id, model: job.model || '', prompt: String(job.prompt).slice(0, 120) });
+      try {
+        await runBrowserTextJob(job, apiUrl, authToken);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        debugLog('text worker 任务失败，准备回传错误', { siteID, id: job.id, error: message });
+        await bgFetch(`${apiUrl}/bridge/text-jobs/${encodeURIComponent(job.id)}/result`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ error: message }),
+        });
+        throw err;
+      }
+    } catch (err) {
+      handleExtensionContextError(err);
+      if (extensionContextInvalidated) {
+        stopped = true;
+        return;
+      }
+      console.warn('[OpenLink] browser text worker error:', err);
+      debugLog('text worker 异常', { siteID, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      running = false;
+    }
+  };
+
+  void tick();
+  const intervalId = window.setInterval(() => {
+    if (stopped || extensionContextInvalidated) {
+      window.clearInterval(intervalId);
+      return;
+    }
+    void tick();
+  }, 2500);
+}
+
+async function runBrowserTextJob(job: any, apiUrl: string, authToken: string) {
+  const adapter = getSiteAdapter();
+  const prompt = String(job.prompt || '');
+  showToast(`开始文本任务: ${job.id}`, 2500);
+  debugLog('text job 开始执行', { id: job.id, siteID: adapter.id, model: job.model || '' });
+
+  const beforeCandidates = getBrowserTextResponseCandidates();
+  const beforeKeys = new Set(beforeCandidates.map(getBrowserTextResponseNodeKey));
+  debugLog('text job 提交前响应集合', { count: beforeCandidates.length, keys: Array.from(beforeKeys).slice(-8) });
+
+  const editor = await waitForCurrentEditor(adapter.config.editor, 20000);
+  await setBrowserTextPrompt(editor, prompt);
+  debugLog('text job Prompt 已写入', { id: job.id, editorText: getEditorText(editor).slice(0, 120) });
+
+  const sendBtn = await waitForBrowserTextSendButton(editor, 90000);
+  if (!sendBtn) throw new Error(`${adapter.id} text send button not found`);
+  debugLog('text job 已定位发送按钮', { text: (sendBtn.textContent || '').trim().slice(0, 60), ariaLabel: sendBtn.getAttribute('aria-label') || '' });
+  await clickElementLikeUser(sendBtn);
+  debugLog('text job 已触发发送按钮点击', { id: job.id });
+
+  const response = await waitForBrowserTextResponse(beforeKeys, prompt, 10 * 60 * 1000);
+  debugLog('text job 检测到稳定响应', { id: job.id, length: response.text.length, key: response.key });
+
+  const resultResp = await bgFetch(`${apiUrl}/bridge/text-jobs/${encodeURIComponent(job.id)}/result`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${authToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      content: response.text,
+      metadata: {
+        site_id: adapter.id,
+        response_key: response.key,
+      },
+    }),
+  });
+  if (!resultResp.ok) throw new Error(`text result upload failed: HTTP ${resultResp.status}`);
+  showToast(`文本任务已完成: ${job.id}`, 2500);
+}
+
+async function waitForCurrentEditor(selector: string, timeoutMs: number): Promise<HTMLElement> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const editor = getCurrentEditor(selector);
+    if (editor) return editor;
+    await sleep(250);
+  }
+  throw new Error(`editor not found: ${selector}`);
+}
+
+async function setBrowserTextPrompt(editor: HTMLElement, text: string): Promise<void> {
+  const adapter = getSiteAdapter();
+  if (adapter.id === 'gemini') {
+    await setGeminiPrompt(editor, text);
+    return;
+  }
+  if (adapter.id === 'chatgpt') {
+    await setChatGPTPrompt(editor, text);
+    return;
+  }
+  if (adapter.id === 'qwen' && editor instanceof HTMLTextAreaElement) {
+    setQwenPrompt(editor, text);
+    await sleep(250);
+    return;
+  }
+  if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
+    applyTextareaValue(editor as HTMLTextAreaElement, text);
+    await sleep(250);
+    return;
+  }
+  editor.focus();
+  try {
+    const selection = window.getSelection();
+    if (selection) {
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    document.execCommand('delete', false);
+    document.execCommand('insertText', false, text);
+  } catch {}
+  editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+  editor.dispatchEvent(new Event('change', { bubbles: true }));
+  await sleep(250);
+  if (!getEditorText(editor).includes(text.trim())) {
+    editor.textContent = text;
+    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+    editor.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+}
+
+async function waitForBrowserTextSendButton(editor: HTMLElement, timeoutMs: number): Promise<HTMLElement | null> {
+  const adapter = getSiteAdapter();
+  if (adapter.id === 'chatgpt') return waitForChatGPTSendButton(editor, timeoutMs);
+  if (adapter.id === 'qwen') return waitForQwenSendButton(editor, timeoutMs);
+  const deadline = Date.now() + timeoutMs;
+  let lastState = '';
+  while (Date.now() < deadline) {
+    const sendBtn = getSendButtonForEditor(editor, adapter.config.sendBtn);
+    if (sendBtn && isVisibleElement(sendBtn) && !(sendBtn as HTMLButtonElement).disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {
+      return sendBtn;
+    }
+    const state = sendBtn ? {
+      disabled: (sendBtn as HTMLButtonElement).disabled,
+      ariaDisabled: sendBtn.getAttribute('aria-disabled') || '',
+      text: (sendBtn.textContent || '').trim().slice(0, 40),
+    } : { missing: true };
+    const summary = JSON.stringify(state);
+    if (summary !== lastState) {
+      lastState = summary;
+      debugLog('text job 等待发送按钮', { siteID: adapter.id, ...state });
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+function getBrowserTextResponseCandidates(): HTMLElement[] {
+  const adapter = getSiteAdapter();
+  const selector = adapter.config.responseSelector;
+  if (!selector) return [];
+  return Array.from(document.querySelectorAll<HTMLElement>(selector))
+    .filter((el) => el.isConnected && isVisibleElement(el) && adapter.isAssistantResponse(el));
+}
+
+function getBrowserTextResponseNodeKey(el: HTMLElement): string {
+  const stable = el.closest('[data-message-id], [data-virtual-list-item-key], [data-testid="receive_message"], .chat-response-message, model-response, [data-message-author-role="assistant"]');
+  const id = stable?.getAttribute('data-message-id')
+    || stable?.getAttribute('data-virtual-list-item-key')
+    || stable?.getAttribute('id')
+    || '';
+  return id ? `${stable?.tagName.toLowerCase()}:${id}` : getElementPathKey(stable ?? el, 10);
+}
+
+function getBrowserTextResponseText(el: HTMLElement): string {
+  const clone = el.cloneNode(true) as HTMLElement;
+  clone.querySelectorAll('button, [role="button"], nav, [data-testid*="action"], [data-testid="message_action_bar"], .message-hoc-container').forEach((node) => node.remove());
+  return (clone.innerText || clone.textContent || '').replace(/\u00a0/g, ' ').trim();
+}
+
+function isLikelyBrowserTextOutput(text: string, prompt: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  const normalizedPrompt = prompt.replace(/\s+/g, ' ').trim();
+  if (normalizedPrompt && normalized === normalizedPrompt) return false;
+  return true;
+}
+
+async function waitForBrowserTextResponse(beforeKeys: Set<string>, prompt: string, timeoutMs: number): Promise<{ key: string; text: string }> {
+  const deadline = Date.now() + timeoutMs;
+  let candidate: HTMLElement | null = null;
+  let candidateKey = '';
+  while (Date.now() < deadline) {
+    const candidates = getBrowserTextResponseCandidates();
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      const el = candidates[i];
+      const key = getBrowserTextResponseNodeKey(el);
+      const text = getBrowserTextResponseText(el);
+      if (!beforeKeys.has(key) && isLikelyBrowserTextOutput(text, prompt)) {
+        candidate = el;
+        candidateKey = key;
+        break;
+      }
+    }
+    if (candidate) {
+      const text = await waitForBrowserTextStability(candidate, prompt, 1600, Math.min(120000, timeoutMs));
+      return { key: candidateKey, text };
+    }
+    await sleep(500);
+  }
+  throw new Error('wait for browser text response timed out');
+}
+
+async function waitForBrowserTextStability(el: HTMLElement, prompt: string, quietMs: number, timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let lastText = '';
+  let stableSince = 0;
+  while (Date.now() < deadline) {
+    const text = getBrowserTextResponseText(el);
+    if (isLikelyBrowserTextOutput(text, prompt) && text === lastText) {
+      if (!stableSince) stableSince = Date.now();
+      if (Date.now() - stableSince >= quietMs) return text;
+    } else {
+      lastText = text;
+      stableSince = 0;
+    }
+    await sleep(500);
+  }
+  if (isLikelyBrowserTextOutput(lastText, prompt)) return lastText;
+  throw new Error('browser text response did not stabilize');
+}
+
+async function clearQwenComposerAttachments(editor: HTMLElement): Promise<void> {
+  for (let pass = 0; pass < 5; pass++) {
+    const buttons = getQwenComposerRemoveButtons(editor);
+    if (buttons.length === 0) return;
+    debugLog('qwen 清理参考图', { pass: pass + 1, count: buttons.length });
+    for (const btn of buttons) {
+      await clickElementLikeUser(btn);
+      await sleep(200);
+    }
+    await sleep(500);
+  }
+}
+
+function getQwenComposerRegion(editor: HTMLElement): Element {
+  return editor.closest('.message-input-container') ?? editor.closest('.chat-prompt') ?? editor.parentElement ?? document.body;
+}
+
+function getQwenComposerRemoveButtons(editor: HTMLElement): HTMLElement[] {
+  const region = getQwenComposerRegion(editor);
+  return Array.from(region.querySelectorAll<HTMLElement>('.vision-item-container .close-button, .fileitem-btn .close-button, button.close-button, .close-button'))
+    .filter((btn) => isVisibleElement(btn));
+}
+
+function getQwenComposerAttachmentCount(editor: HTMLElement): number {
+  const region = getQwenComposerRegion(editor);
+  const images = Array.from(region.querySelectorAll<HTMLImageElement>('img.vision-item-image')).filter((img) => {
+    if (!isVisibleElement(img)) return false;
+    const src = img.currentSrc || img.getAttribute('src') || '';
+    return !!src;
+  });
+  return new Set(images.map((img) => img.currentSrc || img.getAttribute('src') || getElementPathKey(img))).size;
+}
+
+async function attachQwenReferenceImages(editor: HTMLElement, items: any[], apiUrl: string, authToken: string): Promise<void> {
+  const files = await Promise.all(items.map((item, index) => referenceImageJobToFile(item, index, apiUrl, authToken)));
+  const beforeCount = getQwenComposerAttachmentCount(editor);
+  debugLog('qwen 开始附加参考图', {
+    count: files.length,
+    beforeCount,
+    files: files.map((file) => ({ name: file.name, size: file.size, type: file.type })),
+  });
+
+  await openQwenUploadMenu();
+  const input = await waitForElement<HTMLInputElement>('input#filesUpload[type="file"], input[type="file"]', 10000);
+  setFileInputFiles(input, files);
+  debugLog('qwen 已触发文件输入 change', { count: files.length });
+
+  const expectedCount = beforeCount + files.length;
+  const ready = await waitForQwenAttachmentReady(editor, expectedCount, 90000);
+  debugLog('qwen 参考图附加完成', { expectedCount, ready, count: getQwenComposerAttachmentCount(editor) });
+  if (!ready) throw new Error('qwen reference image did not stabilize before prompt');
+}
+
+async function openQwenUploadMenu(): Promise<void> {
+  const isMenuItemVisible = (el: HTMLElement): boolean => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+  };
+  const findUploadItem = () => Array.from(document.querySelectorAll<HTMLElement>('[role="menuitem"], li.mode-select-common-item, .mode-select-dropdown-item'))
+    .find((el) => /上传附件/.test(el.textContent || '') && isMenuItemVisible(el));
+
+  let uploadItem = findUploadItem();
+  if (uploadItem) {
+    await clickElementLikeUser(uploadItem);
+    await sleep(300);
+    return;
+  }
+
+  const trigger = document.querySelector<HTMLElement>('.mode-select .ant-dropdown-trigger, .mode-select-open');
+  if (!trigger) throw new Error('qwen upload menu trigger not found');
+  await clickElementLikeUser(trigger);
+  await sleep(300);
+  uploadItem = findUploadItem();
+  if (!uploadItem) throw new Error('qwen upload menu item not found');
+  await clickElementLikeUser(uploadItem);
+  await sleep(300);
+}
+
+async function waitForQwenAttachmentReady(editor: HTMLElement, expectedCount: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  let lastCount = -1;
+  let readySince = 0;
+  while (Date.now() < deadline) {
+    const count = getQwenComposerAttachmentCount(editor);
+    if (count !== lastCount) {
+      lastCount = count;
+      readySince = 0;
+      debugLog('qwen 等待参考图稳定', { expectedCount, count, timeoutMs });
+    }
+    if (count >= expectedCount) {
+      if (!readySince) readySince = Date.now();
+      if (Date.now() - readySince >= 2500) return true;
+    } else {
+      readySince = 0;
+    }
+    await sleep(500);
+  }
+  return false;
+}
+
+function setQwenPrompt(editor: HTMLTextAreaElement, text: string): void {
+  editor.focus();
+  applyTextareaValue(editor, text);
+}
+
+async function waitForQwenSendButton(editor: HTMLElement, timeoutMs: number): Promise<HTMLElement | null> {
+  const deadline = Date.now() + timeoutMs;
+  let lastState = '';
+  while (Date.now() < deadline) {
+    const sendBtn = getSendButtonForEditor(editor, getSiteConfig().sendBtn)
+      ?? document.querySelector<HTMLElement>('.message-input-right-button-send button.send-button, button.send-button');
+    if (sendBtn && isVisibleElement(sendBtn) && !(sendBtn as HTMLButtonElement).disabled) return sendBtn;
+
+    const state = sendBtn ? {
+      disabled: (sendBtn as HTMLButtonElement).disabled,
+      className: sendBtn.className,
+      text: (sendBtn.textContent || '').trim().slice(0, 40),
+    } : { missing: true };
+    const summary = JSON.stringify(state);
+    if (summary !== lastState) {
+      lastState = summary;
+      debugLog('qwen 等待发送按钮', state);
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+function getQwenGeneratedImageElements(): HTMLImageElement[] {
+  return Array.from(document.querySelectorAll<HTMLImageElement>('.chat-response-message img.qwen-image, .chat-response-message img[src*="/image_gen/"], .chat-response-message img[src*="/image_edit/"]'))
+    .filter((img) => {
+      if (!isVisibleElement(img)) return false;
+      const src = img.currentSrc || img.getAttribute('src') || '';
+      if (!src) return false;
+      if (src.includes('.apng') || img.getAttribute('alt') === '加载中...') return false;
+      if (!src.includes('/image_gen/') && !src.includes('/image_edit/') && !img.classList.contains('qwen-image')) return false;
+      const rect = img.getBoundingClientRect();
+      return img.naturalWidth >= 128 || rect.width >= 120;
+    });
+}
+
+function getQwenImageKeys(): string[] {
+  return Array.from(new Set(getQwenGeneratedImageElements()
+    .map((img) => img.currentSrc || img.getAttribute('src') || '')
+    .filter(Boolean)));
+}
+
+async function waitForNewQwenImage(previousKeysInput: string[] | Set<string>, timeoutMs: number): Promise<HTMLImageElement> {
+  const deadline = Date.now() + timeoutMs;
+  const previousKeys = previousKeysInput instanceof Set ? previousKeysInput : new Set(previousKeysInput);
+  debugLog('qwen 等待新图片', { previousKeys: Array.from(previousKeys), timeoutMs });
+  let lastSeenKeys = '';
+  while (Date.now() < deadline) {
+    const currentKeys = getQwenImageKeys();
+    const currentKeySummary = currentKeys.join(',');
+    if (currentKeySummary !== lastSeenKeys) {
+      lastSeenKeys = currentKeySummary;
+      debugLog('qwen 当前图片 key', currentKeys);
+    }
+    const images = getQwenGeneratedImageElements();
+    for (let i = images.length - 1; i >= 0; i--) {
+      const img = images[i];
+      const key = img.currentSrc || img.getAttribute('src') || '';
+      if (!key || previousKeys.has(key)) continue;
+      if (img.complete && (img.naturalWidth > 0 || img.getBoundingClientRect().width >= 120)) {
+        debugLog('qwen 新图片已就绪', { key, width: img.naturalWidth, height: img.naturalHeight, alt: img.getAttribute('alt') || '' });
+        return img;
+      }
+    }
+    await sleep(1000);
+  }
+  debugLog('qwen 等待新图片超时', { previousKeys: Array.from(previousKeys), timeoutMs, currentKeys: getQwenImageKeys() });
+  throw new Error('wait for qwen generated image timed out');
+}
+
+async function clearChatGPTComposerAttachments(editor: HTMLElement): Promise<void> {
+  for (let pass = 0; pass < 5; pass++) {
+    const buttons = getChatGPTComposerRemoveButtons(editor);
+    if (buttons.length === 0) return;
+    debugLog('chatgpt 清理参考图', { pass: pass + 1, count: buttons.length });
+    for (const btn of buttons) {
+      await clickElementLikeUser(btn);
+      await sleep(150);
+    }
+    await sleep(500);
+  }
+  const remaining = getChatGPTComposerAttachmentCount(editor);
+  if (remaining > 0) debugLog('chatgpt 参考图未完全清理', { remaining });
+}
+
+async function setChatGPTPrompt(editor: HTMLElement, text: string) {
+  editor.focus();
+  const selection = window.getSelection();
+  if (selection) {
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  try { document.execCommand('delete', false); } catch {}
+  await sleep(80);
+  editor.focus();
+  try { document.execCommand('insertText', false, text); } catch {}
+  editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+  editor.dispatchEvent(new Event('change', { bubbles: true }));
+  await sleep(200);
+  if (!getEditorText(editor).includes(text.trim())) {
+    editor.textContent = text;
+    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+    editor.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+}
+
+async function waitForChatGPTSendButton(editor: HTMLElement, timeoutMs: number): Promise<HTMLElement | null> {
+  const deadline = Date.now() + timeoutMs;
+  let lastState = '';
+  while (Date.now() < deadline) {
+    const sendBtn = getSendButtonForEditor(editor, getSiteConfig().sendBtn)
+      ?? getChatGPTComposerRegion(editor).querySelector<HTMLElement>('button#composer-submit-button, button[data-testid="send-button"], button[aria-label="发送提示"], button[aria-label*="Send"]');
+    if (sendBtn && isVisibleElement(sendBtn) && !(sendBtn as HTMLButtonElement).disabled) return sendBtn;
+
+    const state = getChatGPTComposerButtonState(editor);
+    const summary = JSON.stringify(state);
+    if (summary !== lastState) {
+      lastState = summary;
+      debugLog('chatgpt 等待发送按钮', state);
+    }
+    await sleep(250);
+  }
+  debugLog('chatgpt 发送按钮等待超时', getChatGPTComposerButtonState(editor));
+  return null;
+}
+
+async function attachChatGPTReferenceImages(editor: HTMLElement, items: any[], apiUrl: string, authToken: string): Promise<void> {
+  const files = await Promise.all(items.map((item, index) => referenceImageJobToFile(item, index, apiUrl, authToken)));
+  const beforeCount = getChatGPTComposerAttachmentCount(editor);
+  debugLog('chatgpt 开始附加参考图', {
+    count: files.length,
+    beforeCount,
+    files: files.map((file) => ({ name: file.name, size: file.size, type: file.type })),
+  });
+
+  const input = document.querySelector<HTMLInputElement>('input#upload-photos[type="file"], input#upload-files[type="file"], input[type="file"][accept*="image"]');
+  if (!input) throw new Error('chatgpt file input not found');
+  setFileInputFiles(input, files);
+  debugLog('chatgpt 已触发文件输入 change', { count: files.length });
+
+  const expectedCount = beforeCount + files.length;
+  const ready = await waitForChatGPTAttachmentReady(editor, expectedCount, 90000);
+  debugLog('chatgpt 参考图附加完成', { expectedCount, ready, count: getChatGPTComposerAttachmentCount(editor) });
+  if (!ready) throw new Error('chatgpt reference image did not stabilize before prompt');
+}
+
+function getChatGPTComposerRegion(editor: HTMLElement): Element {
+  return editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? editor.parentElement ?? document.body;
+}
+
+function getChatGPTComposerRemoveButtons(editor: HTMLElement): HTMLElement[] {
+  const region = getChatGPTComposerRegion(editor);
+  return Array.from(region.querySelectorAll<HTMLElement>('button[aria-label^="移除文件"], button[aria-label^="Remove file"], button[aria-label*="移除文件"], button[aria-label*="Remove file"]'))
+    .filter((btn) => isVisibleElement(btn));
+}
+
+function getChatGPTComposerAttachmentCount(editor: HTMLElement): number {
+  const region = getChatGPTComposerRegion(editor);
+  const removeButtons = getChatGPTComposerRemoveButtons(editor);
+  if (removeButtons.length > 0) return removeButtons.length;
+  const images = Array.from(region.querySelectorAll<HTMLImageElement>('img')).filter((img) => {
+    const src = img.currentSrc || img.getAttribute('src') || '';
+    if (!src || !src.includes('/backend-api/estuary/content')) return false;
+    if (!isVisibleElement(img)) return false;
+    const rect = img.getBoundingClientRect();
+    return rect.width > 16 && rect.height > 16;
+  });
+  return new Set(images.map((img) => img.currentSrc || img.getAttribute('src') || getElementPathKey(img))).size;
+}
+
+function getChatGPTComposerButtonState(editor: HTMLElement): Array<Record<string, unknown>> {
+  const region = getChatGPTComposerRegion(editor);
+  return Array.from(region.querySelectorAll<HTMLElement>('button'))
+    .filter((btn) => isVisibleElement(btn))
+    .map((btn) => ({
+      ariaLabel: btn.getAttribute('aria-label') || '',
+      testId: btn.getAttribute('data-testid') || '',
+      id: btn.id || '',
+      disabled: (btn as HTMLButtonElement).disabled,
+      text: (btn.textContent || '').trim().slice(0, 40),
+    }))
+    .slice(-10);
+}
+
+async function waitForChatGPTAttachmentReady(editor: HTMLElement, expectedCount: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  let lastCount = -1;
+  let readySince = 0;
+  while (Date.now() < deadline) {
+    const count = getChatGPTComposerAttachmentCount(editor);
+    if (count !== lastCount) {
+      lastCount = count;
+      readySince = 0;
+      debugLog('chatgpt 等待参考图稳定', { expectedCount, count, timeoutMs });
+    }
+    if (count >= expectedCount) {
+      if (!readySince) readySince = Date.now();
+      if (Date.now() - readySince >= 2500) return true;
+    } else {
+      readySince = 0;
+    }
+    await sleep(500);
+  }
+  return false;
+}
+
+function getChatGPTGeneratedImageElements(): HTMLImageElement[] {
+  const images = Array.from(document.querySelectorAll<HTMLImageElement>('img[src*="/backend-api/estuary/content"], img[src*="chatgpt.com/backend-api/estuary/content"]'));
+  const generatedSrcs = new Set(images
+    .filter((img) => {
+      if (isChatGPTComposerImage(img) || isChatGPTUserUploadedImage(img)) return false;
+      const alt = (img.getAttribute('alt') || '').toLowerCase();
+      return alt.includes('已生成') || alt.includes('generated');
+    })
+    .map((img) => img.currentSrc || img.getAttribute('src') || '')
+    .filter(Boolean));
+  return images.filter((img) => {
+    if (isChatGPTComposerImage(img)) return false;
+    if (isChatGPTUserUploadedImage(img)) return false;
+    if (!isVisibleElement(img)) return false;
+    const src = img.currentSrc || img.getAttribute('src') || '';
+    if (!src) return false;
+    const alt = (img.getAttribute('alt') || '').toLowerCase();
+    if (alt.includes('已上传') || alt.includes('uploaded')) return false;
+    if (generatedSrcs.has(src)) return true;
+    const bigEnough = img.naturalWidth >= 256 || img.getBoundingClientRect().width >= 180;
+    return bigEnough && (alt.includes('已生成') || alt.includes('generated'));
+  });
+}
+
+function isChatGPTComposerImage(img: HTMLImageElement): boolean {
+  const composerForm = img.closest('form');
+  if (composerForm?.querySelector('#prompt-textarea')) return true;
+  const composerRegion = img.closest('[data-testid*="composer"], .group\\/composer');
+  return !!composerRegion;
+}
+
+function isChatGPTUserUploadedImage(img: HTMLImageElement): boolean {
+  const message = img.closest('[data-message-author-role]');
+  if (message?.getAttribute('data-message-author-role') === 'user') return true;
+  const alt = (img.getAttribute('alt') || '').toLowerCase();
+  return alt.includes('已上传') || alt.includes('uploaded');
+}
+
+function getChatGPTImageKeys(): string[] {
+  return Array.from(new Set(getChatGPTGeneratedImageElements()
+    .map((img) => img.currentSrc || img.getAttribute('src') || '')
+    .filter(Boolean)));
+}
+
+async function waitForNewChatGPTImage(previousKeysInput: string[] | Set<string>, timeoutMs: number): Promise<HTMLImageElement> {
+  const deadline = Date.now() + timeoutMs;
+  const previousKeys = previousKeysInput instanceof Set ? previousKeysInput : new Set(previousKeysInput);
+  debugLog('chatgpt 等待新图片', { previousKeys: Array.from(previousKeys), timeoutMs });
+  let lastSeenKeys = '';
+  while (Date.now() < deadline) {
+    const currentKeys = getChatGPTImageKeys();
+    const currentKeySummary = currentKeys.join(',');
+    if (currentKeySummary !== lastSeenKeys) {
+      lastSeenKeys = currentKeySummary;
+      debugLog('chatgpt 当前图片 key', currentKeys);
+    }
+    const images = getChatGPTGeneratedImageElements();
+    for (let i = images.length - 1; i >= 0; i--) {
+      const img = images[i];
+      const key = img.currentSrc || img.getAttribute('src') || '';
+      if (!key || previousKeys.has(key)) continue;
+      if (img.complete && (img.naturalWidth > 0 || img.getBoundingClientRect().width >= 180)) {
+        debugLog('chatgpt 新图片已就绪', { key, width: img.naturalWidth, height: img.naturalHeight, alt: img.getAttribute('alt') || '' });
+        return img;
+      }
+    }
+    await sleep(1000);
+  }
+  debugLog('chatgpt 等待新图片超时', { previousKeys: Array.from(previousKeys), timeoutMs, currentKeys: getChatGPTImageKeys() });
+  throw new Error('wait for chatgpt generated image timed out');
 }
 
 async function fetchGeminiOriginalImageWithRetry(originalURL: string): Promise<{ bodyBase64: string; contentType: string; finalUrl: string }> {
@@ -3224,10 +4237,24 @@ async function fillAndSend(result: string, autoSend = false) {
       applyTextareaValue(ta, next);
     }
   } else if (fillMethod === 'prosemirror') {
-    const current = editor.innerText.trim();
-    editor.innerHTML = current ? current + '\n' + result : result;
-    editor.dispatchEvent(new Event('input', { bubbles: true }));
+    const current = getEditorText(editor).trim();
+    const textToInsert = current ? `\n${result}` : result;
+    const selection = window.getSelection();
+    if (selection) {
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    try { document.execCommand('insertText', false, textToInsert); } catch {}
+    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: textToInsert }));
     editor.dispatchEvent(new Event('change', { bubbles: true }));
+    if (!getEditorText(editor).includes(result.trim())) {
+      editor.textContent = current ? `${current}\n${result}` : result;
+      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: result }));
+      editor.dispatchEvent(new Event('change', { bubbles: true }));
+    }
   }
 
   if (autoSend) {

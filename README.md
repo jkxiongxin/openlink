@@ -61,6 +61,8 @@ openlink
 
 如果你要使用 [Google Labs Flow](https://labs.google/fx) 的图片 / 视频生成能力，则不需要点击「🔗 初始化」。Flow 通过 OpenLink 提供的 OpenAI 兼容接口下发任务，由浏览器扩展在已登录的 Flow 页面中代为执行。
 
+如果你要使用浏览器网页作为 OpenAI 兼容的文本接口，也不需要点击「🔗 初始化」。保持对应网站的已登录页面打开，服务端会把 `/v1/chat/completions` 文本任务交给扩展在页面中提交并等待回答。Gemini 文本接口同时支持 `gemini.google.com` 和 `aistudio.google.com` 页面接单。
+
 ---
 
 ## 推荐平台
@@ -78,11 +80,58 @@ openlink
 | Google AI Studio | ✅ | 推荐，原生支持系统提示词 |
 | Google Gemini | ✅ | |
 | LMArena / Arena (`arena.ai`) | ✅ | 支持 `/text/direct` 和进入对话后的 `/c/...` 页面 |
+| ChatGPT (`chatgpt.com`) | ✅ | 支持工具卡片、图片任务和 Phase 1 浏览器文本接口 |
+| DeepSeek (`chat.deepseek.com`) | ✅ | 支持工具卡片和 Phase 1 浏览器文本接口 |
+| 通义千问 / Qwen (`chat.qwen.ai`) | ✅ | 支持工具卡片、图片任务和 Phase 1 浏览器文本接口 |
+| 豆包 / Doubao (`doubao.com`) | ✅ | 支持工具卡片和 Phase 1 浏览器文本接口 |
 | Google Labs Flow (`labs.google/fx`) | ✅ | 支持图片 / 视频生成；通过 OpenAI 兼容接口调用；无需初始化 |
 
 > LMArena / Arena 目前通过对话消息注入提示词工作，兼容性和工具调用稳定性仍依赖具体模型与页面结构。
 
 > Flow 不是通过网页对话里的 `<tool>` 调用来工作的，而是由扩展在已打开的 Flow 页面里执行生成任务，所以不需要「初始化」步骤。
+
+## OpenAI 兼容浏览器接口
+
+OpenLink 现在可以把一部分 OpenAI 兼容请求路由到已打开的浏览器网页：
+
+- `GET /v1/models`：返回媒体模型和浏览器文本模型
+- `POST /v1/chat/completions`：文本模型返回普通 chat completion；媒体模型保持原有图片 / 视频响应
+- `POST /v1/images/generations`：图片生成
+- `POST /v1/images/edits`：图片编辑 / 参考图生成
+
+Phase 1 文本模型：
+
+| 模型 ID | 网站 |
+|---------|------|
+| `gemini-web/gemini-2.5-pro` | Gemini |
+| `chatgpt-web/gpt-4o` | ChatGPT |
+| `qwen-web/qwen-plus` | Qwen |
+| `deepseek-web/deepseek-chat` | DeepSeek |
+| `doubao-web/doubao-seed-2.0` | Doubao |
+
+文本调用示例：
+
+```bash
+curl http://127.0.0.1:39527/v1/chat/completions \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-web/deepseek-chat",
+    "messages": [
+      {
+        "role": "user",
+        "content": "用三句话解释 OpenLink 的浏览器文本接口"
+      }
+    ]
+  }'
+```
+
+当前限制：
+
+- 需要先打开并登录目标网站页面，扩展会在该页面轮询任务。
+- 文本接口 Phase 1 只支持非流式响应；`stream: true` 会返回明确的暂不支持错误。
+- 文本任务使用最近一条用户消息作为主要提示词；图片引用的文本多模态输入还没有在所有文本网站上做完整适配。
+- 网页 DOM 变化可能影响提交按钮和回答提取，调试新站点时请先打开扩展的 `debugMode`。
 
 ## Flow 使用说明
 

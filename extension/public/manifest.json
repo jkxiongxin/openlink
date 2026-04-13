@@ -10,7 +10,12 @@
   "permissions": ["activeTab", "storage", "tabs"],
   "host_permissions": [
     "http://127.0.0.1:*/*",
+    "https://chatgpt.com/*",
+    "https://*.chatgpt.com/*",
     "https://labs.google/*",
+    "https://cdn.qwenlm.ai/*",
+    "https://*.qwenlm.ai/*",
+    "https://qwen-webui-prod.oss-accelerate.aliyuncs.com/*",
     "https://storage.googleapis.com/*",
     "https://aisandbox-pa.googleapis.com/*",
     "https://lh3.googleusercontent.com/*",
@@ -22,7 +27,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://*.gemini.google.com/*", "*://aistudio.google.com/*", "*://arena.ai/*", "*://chat.deepseek.com/*", "*://tongyi.aliyun.com/*", "*://chat.qwen.ai/*", "*://www.doubao.com/*", "*://doubao.com/*", "*://labs.google/*"],
+      "matches": ["*://chatgpt.com/*", "*://*.chatgpt.com/*", "*://*.gemini.google.com/*", "*://aistudio.google.com/*", "*://arena.ai/*", "*://chat.deepseek.com/*", "*://tongyi.aliyun.com/*", "*://chat.qwen.ai/*", "*://www.doubao.com/*", "*://doubao.com/*", "*://labs.google/*"],
       "js": ["content.js"],
       "run_at": "document_start"
     }
@@ -30,7 +35,7 @@
   "web_accessible_resources": [
     {
       "resources": ["injected.js"],
-      "matches": ["*://*.gemini.google.com/*", "*://aistudio.google.com/*", "*://arena.ai/*", "*://chat.deepseek.com/*", "*://tongyi.aliyun.com/*", "*://chat.qwen.ai/*", "*://www.doubao.com/*", "*://doubao.com/*", "*://labs.google/*"]
+      "matches": ["*://chatgpt.com/*", "*://*.chatgpt.com/*", "*://*.gemini.google.com/*", "*://aistudio.google.com/*", "*://arena.ai/*", "*://chat.deepseek.com/*", "*://tongyi.aliyun.com/*", "*://chat.qwen.ai/*", "*://www.doubao.com/*", "*://doubao.com/*", "*://labs.google/*"]
     }
   ]
 }
