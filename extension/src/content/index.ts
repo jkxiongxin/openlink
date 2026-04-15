@@ -1,678 +1,134 @@
 import { countLabsFxReferenceCards, findLabsFxComposerRegion } from './labsfx_dom';
+import { ensureLabsFxMode, getLabsFxTileKeys, getLabsFxTileMediaKey, getLabsFxVisibleResourceTiles, waitForNewLabsFxGeneratedMedia } from './labsfx_media_dom';
+import { createSiteAdapters, defaultEditorRegion, type SiteAdapter, type SiteConfig } from './site_adapters';
+import { createInputCompletion, getEditorText } from './input_completion';
+import { parseOptions } from './tool_parsers';
+import { debugLog, setDebugModeEnabled } from './debug_log';
+import { bgFetch, bgFetchBinary, getStoredConfig, handleExtensionContextError, isExtensionContextInvalidated } from './runtime_bridge';
+import { createDebugPanelController } from './debug_panel';
+import { shortenHtml } from './text_utils';
+import { createToolObserver } from './tool_observer';
+import { applyTextareaValue, getEditorCandidates, getNativeSetter, getVisibleTextareas, isVisibleElement, querySelectorFirst, setContentEditableText } from './editor_dom';
+import { base64ToBytes, blobToBase64, canvasImageToMediaResponse, guessImageExtension, guessMediaExtension, type MediaBinaryResponse } from './media_utils';
+import { showCountdownToast, showQuestionPopup, showToast } from './ui_feedback';
+import { createQwenDom } from './qwen_dom';
+import { createChatGptDom } from './chatgpt_dom';
+import { createGeminiDom } from './gemini_dom';
+import { createBrowserTextInput } from './browser_text_input';
+import { createBrowserTextResponse, getBrowserTextResponseNodeKey, getBrowserTextResponseTextForSite, isLikelyBrowserTextOutput } from './browser_text_response';
+import { fetchGeminiOriginalImageWithRetry, fetchQwenImageWithRetry } from './media_fetchers';
+import { clickElementLikeUser, sleep, waitForElement } from './dom_actions';
 
-function parseOptions(raw: unknown): string[] {
-  if (Array.isArray(raw)) return raw;
-  if (typeof raw === 'string') { try { return JSON.parse(raw); } catch { return []; } }
-  return [];
-}
+const {
+  resetGeminiMediaCapture,
+  recordGeminiMediaCapture,
+  getGeminiMediaSeq,
+  setGeminiPrompt,
+  findGeminiComposerRegion,
+  clearGeminiReferenceImages,
+  getGeminiAttachmentCount,
+  ensureGeminiImageMode,
+  attachGeminiReferenceImages,
+  waitForGeminiAttachmentReady,
+  getGeminiAttachmentState,
+  getGeminiImageKeys,
+  waitForGeminiOriginalMediaURL,
+  waitForNewGeminiImage,
+} = createGeminiDom({
+  referenceImageJobToFile,
+  setFileInputFiles,
+  getEditorText,
+  getSendButtonSelector: () => getSiteConfig().sendBtn,
+});
 
-function getNativeSetter() {
-  return Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-}
+const siteAdapters = createSiteAdapters({
+  hashStr,
+  isVisibleElement,
+  querySelectorFirst,
+  fillArenaTextarea,
+  findGeminiComposerRegion,
+});
 
-function parseXmlToolCall(raw: string): any | null {
-  const nameMatch = raw.match(/^<tool\s+name="([^"]+)"(?:\s+call_id="([^"]+)")?/);
-  if (!nameMatch) return null;
-  const name = nameMatch[1];
-  const callId = nameMatch[2] || null;
-  const args: Record<string, string> = {};
-  const paramRe = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/g;
-  let m;
-  while ((m = paramRe.exec(raw)) !== null) args[m[1]] = m[2];
-  return { name, args, callId };
-}
+const { mountInputListener } = createInputCompletion({
+  bgFetch,
+  getCurrentEditor,
+  getNativeSetter,
+  getSiteConfig,
+});
 
-function tryParseToolJSON(raw: string): any | null {
-  try { return JSON.parse(raw); } catch {}
-  try {
-    let result = '';
-    let inString = false;
-    let escaped = false;
-    for (let i = 0; i < raw.length; i++) {
-      const ch = raw[i];
-      if (escaped) { result += ch; escaped = false; continue; }
-      if (ch === '\\') { result += ch; escaped = true; continue; }
-      if (ch === '"') {
-        if (!inString) { inString = true; result += ch; continue; }
-        let j = i + 1;
-        while (j < raw.length && raw[j] === ' ') j++;
-        const next = raw[j];
-        if (next === ':' || next === ',' || next === '}' || next === ']') {
-          inString = false; result += ch;
-        } else {
-          result += '\\"';
-        }
-        continue;
-      }
-      result += ch;
-    }
-    return JSON.parse(result);
-  } catch {}
-  return null;
-}
+const { startDOMObserver } = createToolObserver({
+  hashStr,
+  getConversationId,
+  getSourceKey: (sourceEl) => getSiteAdapter().getSourceKey(sourceEl),
+  getToolCardMount: (sourceEl) => getSiteAdapter().getToolCardMount(sourceEl),
+  isAssistantResponse: (el) => getSiteAdapter().isAssistantResponse(el),
+  shouldRenderToolText: (text, sourceEl) => getSiteAdapter().shouldRenderToolText(text, sourceEl),
+  fillAndSend,
+});
 
-type FillMethod = 'paste' | 'execCommand' | 'value' | 'prosemirror';
+const {
+  clearQwenComposerAttachments,
+  getQwenComposerAttachmentCount,
+  attachQwenReferenceImages,
+  setQwenPrompt,
+  waitForQwenSendButton,
+  getQwenImageKeys,
+  waitForNewQwenImage,
+  getQwenLatestResponseState,
+  isQwenResponseComplete,
+} = createQwenDom({
+  referenceImageJobToFile,
+  setFileInputFiles,
+  getSendButtonForEditor,
+  getSendButtonSelector: () => getSiteConfig().sendBtn,
+  getBrowserTextResponseText: (el) => getBrowserTextResponseTextForSite(getSiteAdapter().id, el),
+});
 
-interface SiteConfig {
-  editor: string;
-  sendBtn: string;
-  stopBtn: string | null;
-  fillMethod: FillMethod;
-  useObserver: boolean;
-  responseSelector?: string;
-}
+const {
+  clearChatGPTComposerAttachments,
+  getChatGPTComposerAttachmentCount,
+  attachChatGPTReferenceImages,
+  setChatGPTPrompt,
+  waitForChatGPTSendButton,
+  getChatGPTImageKeys,
+  waitForNewChatGPTImage,
+} = createChatGptDom({
+  referenceImageJobToFile,
+  setFileInputFiles,
+  getEditorText,
+  getSendButtonForEditor,
+  getSendButtonSelector: () => getSiteConfig().sendBtn,
+});
 
-interface SiteAdapter {
-  id: string;
-  matches(): boolean;
-  config: SiteConfig;
-  getConversationId(): string;
-  getSourceKey(sourceEl?: Element): string;
-  isAssistantResponse(el: Element | null): boolean;
-  shouldRenderToolText(text: string, sourceEl?: Element): boolean;
-  getToolCardMount(sourceEl: Element): { anchor: Element; before: Element | null } | null;
-  getEditorRegion(editor: Element | null): Element | null;
-  getSendButton(editor: HTMLElement, sendBtnSel: string): HTMLElement | null;
-  fillValue?(editor: HTMLElement, text: string, editorSel: string, sendBtnSel: string): Promise<boolean>;
-}
+const {
+  waitForCurrentEditor,
+  setBrowserTextPrompt,
+  waitForBrowserTextSendButton,
+} = createBrowserTextInput({
+  getSiteAdapter,
+  getCurrentEditor,
+  getEditorText,
+  getSendButtonForEditor,
+  setGeminiPrompt,
+  setChatGPTPrompt,
+  setQwenPrompt,
+  waitForChatGPTSendButton,
+  waitForQwenSendButton,
+});
 
-function defaultConversationId(): string {
-  const m = location.pathname.match(/\/a\/chat\/s\/([^/?#]+)/) || location.pathname.match(/\/chat\/([^/?#]+)/) || location.search.match(/[?&]id=([^&]+)/);
-  return m ? m[1] : '__default__';
-}
-
-function getElementPathKey(el: Element | null, depth = 6): string {
-  if (!el) return 'none';
-  const parts: string[] = [];
-  let cursor: Element | null = el;
-  while (cursor && parts.length < depth) {
-    let index = 0;
-    let prev = cursor.previousElementSibling;
-    while (prev) { index++; prev = prev.previousElementSibling; }
-    parts.push(`${cursor.tagName.toLowerCase()}:${index}`);
-    cursor = cursor.parentElement;
-  }
-  return parts.join('>');
-}
-
-function defaultSourceKey(sourceEl?: Element): string {
-  if (!sourceEl) return 'global';
-  const item = sourceEl.closest('[data-virtual-list-item-key]');
-  if (item) return item.getAttribute('data-virtual-list-item-key') || 'item';
-  const message = sourceEl.closest('.ds-message, message-content, ms-chat-turn, .prose');
-  if (message) return `${getElementPathKey(message)}:${hashStr((message.textContent || '').slice(0, 200))}`;
-  return `${getElementPathKey(sourceEl)}:${hashStr((sourceEl.textContent || '').slice(0, 120))}`;
-}
-
-function defaultToolMount(sourceEl: Element): { anchor: Element; before: Element | null } | null {
-  const messageContent = sourceEl.closest('message-content') ?? sourceEl.closest('.prose') ?? sourceEl;
-  const anchor = messageContent.parentElement ?? sourceEl.parentElement;
-  if (!anchor) return null;
-  return { anchor, before: messageContent };
-}
-
-function defaultEditorRegion(editor: Element | null): Element | null {
-  if (!editor) return null;
-  return editor.closest('form') ?? editor.parentElement?.parentElement ?? editor.parentElement ?? null;
-}
-
-function arenaActionRow(root: Element): Element | null {
-  return Array.from(root.children).find((child) => {
-    if (!(child instanceof Element)) return false;
-    const hasLike = !!child.querySelector('button[aria-label="Like this response"]');
-    const hasDislike = !!child.querySelector('button[aria-label="Dislike this response"]');
-    return hasLike && hasDislike;
-  }) as Element | null;
-}
-
-const siteAdapters: SiteAdapter[] = [
-  {
-    id: 'arena',
-    matches: () => location.hostname === 'arena.ai' && (location.pathname.startsWith('/text/direct') || location.pathname.startsWith('/c/')),
-    config: {
-      editor: 'textarea[name="message"][placeholder*="Ask followup"], textarea[name="message"], form textarea, textarea',
-      sendBtn: 'form button[type="submit"]:not([disabled]), form button[type="submit"]',
-      stopBtn: null,
-      fillMethod: 'value',
-      useObserver: true,
-      responseSelector: '.prose',
-    },
-    getConversationId: defaultConversationId,
-    getSourceKey(sourceEl) {
-      if (!sourceEl) return 'global';
-      let cursor: Element | null = sourceEl.closest('.prose') ?? sourceEl;
-      while (cursor) {
-        const row = arenaActionRow(cursor);
-        if (row) return `${getElementPathKey(cursor)}:${hashStr((cursor.textContent || '').slice(0, 300))}`;
-        cursor = cursor.parentElement;
-      }
-      return defaultSourceKey(sourceEl);
-    },
-    isAssistantResponse(el) {
-      if (!el) return false;
-      let cursor: Element | null = el.closest('.prose') ?? el;
-      while (cursor) {
-        const row = arenaActionRow(cursor);
-        if (row) return true;
-        cursor = cursor.parentElement;
-      }
-      return false;
-    },
-    shouldRenderToolText(text, sourceEl) {
-      if (sourceEl?.closest('pre, code')) return false;
-      const normalized = text.replace(/\s+/g, ' ').trim();
-      if (!normalized.startsWith('<tool')) return false;
-      return true;
-    },
-    getToolCardMount(sourceEl) {
-      const prose = sourceEl.closest('.prose') ?? sourceEl;
-      let cursor: Element | null = prose;
-      while (cursor) {
-        const row = arenaActionRow(cursor);
-        if (row) return { anchor: cursor, before: row };
-        cursor = cursor.parentElement;
-      }
-      const messageCard = prose.closest('.bg-surface-primary.relative.flex.w-full.min-w-0.flex-1.flex-col') as Element | null;
-      if (messageCard) return { anchor: messageCard, before: messageCard.lastElementChild ?? null };
-      const proseWrapper = prose.parentElement?.parentElement ?? prose.parentElement;
-      if (!proseWrapper) return null;
-      return { anchor: proseWrapper, before: proseWrapper.firstElementChild ?? null };
-    },
-    getEditorRegion: defaultEditorRegion,
-    getSendButton(editor, sendBtnSel) {
-      const form = editor.closest('form');
-      if (form) {
-        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
-          const btn = form.querySelector(sel) as HTMLElement | null;
-          if (btn && isVisibleElement(btn)) return btn;
-        }
-      }
-      return querySelectorFirst(sendBtnSel);
-    },
-    async fillValue(editor, text, editorSel, sendBtnSel) {
-      const ta = await fillArenaTextarea(text, editorSel, sendBtnSel);
-      return !!ta;
-    },
-  },
-  {
-    id: 'deepseek',
-    matches: () => location.hostname === 'chat.deepseek.com',
-    config: {
-      editor: 'textarea[placeholder*="DeepSeek"], textarea',
-      sendBtn: 'div.bf38813a div[role="button"][aria-disabled], div[role="button"][aria-disabled]',
-      stopBtn: null,
-      fillMethod: 'value',
-      useObserver: true,
-      responseSelector: '.ds-message .ds-markdown',
-    },
-    getConversationId: defaultConversationId,
-    getSourceKey: defaultSourceKey,
-    isAssistantResponse(el) {
-      if (!el) return false;
-      const item = el.closest('[data-virtual-list-item-key]');
-      if (!item) return false;
-      if (!item.querySelector('.ds-message .ds-markdown')) return false;
-      if (item.querySelector('textarea')) return false;
-      return true;
-    },
-    shouldRenderToolText: () => true,
-    getToolCardMount(sourceEl) {
-      const message = sourceEl.closest('[data-virtual-list-item-key]') ?? sourceEl.closest('.ds-message')?.parentElement;
-      if (!message) return null;
-      const actionRow = Array.from(message.children).find((child) => {
-        if (!(child instanceof Element)) return false;
-        return !!child.querySelector('div[role="button"][aria-disabled]');
-      }) as Element | undefined;
-      return { anchor: message, before: actionRow ?? null };
-    },
-    getEditorRegion: defaultEditorRegion,
-    getSendButton(editor) {
-      const region = defaultEditorRegion(editor);
-      if (!region) return null;
-      const buttons = Array.from(region.querySelectorAll<HTMLElement>('div[role="button"][aria-disabled]')).filter((btn) => isVisibleElement(btn));
-      return buttons.at(-1) ?? null;
-    },
-  },
-  {
-    id: 'labsfx',
-    matches: () => location.hostname === 'labs.google' && location.pathname.startsWith('/fx'),
-    config: {
-      editor: 'div[role="textbox"][data-slate-editor="true"][contenteditable="true"]',
-      sendBtn: 'button',
-      stopBtn: null,
-      fillMethod: 'execCommand',
-      useObserver: false,
-    },
-    getConversationId: defaultConversationId,
-    getSourceKey: defaultSourceKey,
-    isAssistantResponse: () => false,
-    shouldRenderToolText: () => false,
-    getToolCardMount: defaultToolMount,
-    getEditorRegion(editor) {
-      if (!editor) return null;
-      return editor.closest('.sc-84e494b2-0') ?? defaultEditorRegion(editor);
-    },
-    getSendButton(editor) {
-      const region = (editor.closest('.sc-84e494b2-0') ?? defaultEditorRegion(editor)) as Element | null;
-      if (!region) return null;
-      const buttons = Array.from(region.querySelectorAll<HTMLElement>('button')).filter((btn) => isVisibleElement(btn));
-      const action = buttons.findLast((btn) => {
-        const iconText = btn.querySelector('.google-symbols')?.textContent?.trim();
-        return iconText === 'arrow_forward' || (btn.textContent || '').includes('创建');
-      });
-      return action ?? buttons.at(-1) ?? null;
-    },
-  },
-  {
-    id: 'doubao',
-    matches: () => location.hostname === 'www.doubao.com' || location.hostname === 'doubao.com',
-    config: {
-      editor: 'textarea[data-testid="chat_input_input"], textarea.semi-input-textarea',
-      sendBtn: 'button[data-testid="chat_input_send_button"], #flow-end-msg-send',
-      stopBtn: null,
-      fillMethod: 'value',
-      useObserver: true,
-      responseSelector: '[data-testid="receive_message"] [data-testid="message_text_content"], [data-testid="receive_message"] [data-testid="message_content"]',
-    },
-    getConversationId: defaultConversationId,
-    getSourceKey(sourceEl) {
-      if (!sourceEl) return 'global';
-      const msg = sourceEl.closest('[data-testid="message_content"]');
-      const id = msg?.getAttribute('data-message-id');
-      if (id) return id;
-      return defaultSourceKey(sourceEl);
-    },
-    isAssistantResponse(el) {
-      if (!el) return false;
-      const receive = el.closest('[data-testid="receive_message"]');
-      if (!receive) return false;
-      return !!receive.querySelector('[data-testid="message_action_bar"]');
-    },
-    shouldRenderToolText(text, sourceEl) {
-      if (sourceEl?.closest('pre, code')) return false;
-      return text.replace(/\s+/g, ' ').includes('<tool');
-    },
-    getToolCardMount(sourceEl) {
-      const receive = sourceEl.closest('[data-testid="receive_message"]');
-      if (!receive) return null;
-      const content = receive.querySelector('[data-testid="message_content"]') as Element | null;
-      const column = content?.parentElement as Element | null;
-      const actionBar = receive.querySelector('[data-testid="message_action_bar"]') as Element | null;
-      if (column) return { anchor: column, before: actionBar?.parentElement ?? actionBar ?? null };
-      if (content) return { anchor: content, before: content.lastElementChild };
-      return { anchor: receive, before: actionBar };
-    },
-    getEditorRegion(editor) {
-      if (!editor) return null;
-      return editor.closest('.relative.flex.flex-col-reverse') ?? editor.closest('[data-testid="input-container"]') ?? defaultEditorRegion(editor);
-    },
-    getSendButton(editor, sendBtnSel) {
-      const region = (editor.closest('.relative.flex.flex-col-reverse') ?? defaultEditorRegion(editor)) as Element | null;
-      if (region) {
-        const btn = region.querySelector<HTMLElement>('button[data-testid="chat_input_send_button"], #flow-end-msg-send');
-        if (btn && isVisibleElement(btn)) return btn;
-      }
-      return querySelectorFirst(sendBtnSel);
-    },
-  },
-  {
-    id: 'qwen',
-    matches: () => location.hostname === 'tongyi.aliyun.com' || location.hostname === 'chat.qwen.ai',
-    config: {
-      editor: 'textarea.message-input-textarea, .message-input-container textarea',
-      sendBtn: '.message-input-right-button-send button.send-button, button.send-button',
-      stopBtn: null,
-      fillMethod: 'value',
-      useObserver: true,
-      responseSelector: '.chat-response-message .response-message-content .qwen-markdown, .chat-response-message .response-message-content',
-    },
-    getConversationId: defaultConversationId,
-    getSourceKey(sourceEl) {
-      if (!sourceEl) return 'global';
-      const msg = sourceEl.closest('.chat-response-message');
-      if (msg?.id) return msg.id;
-      return defaultSourceKey(sourceEl);
-    },
-    isAssistantResponse(el) {
-      if (!el) return false;
-      const msg = el.closest('.chat-response-message');
-      if (!msg) return false;
-      if (msg.querySelector('.response-message-content')) return true;
-      return false;
-    },
-    shouldRenderToolText(text, sourceEl) {
-      if (sourceEl?.closest('pre, code')) return false;
-      return text.replace(/\s+/g, ' ').includes('<tool');
-    },
-    getToolCardMount(sourceEl) {
-      const message = sourceEl.closest('.chat-response-message');
-      if (!message) return null;
-      const body = message.querySelector('.chat-response-message-right > div') as Element | null;
-      if (!body) return { anchor: message, before: message.firstElementChild };
-      const footer = body.querySelector('.message-hoc-container');
-      return { anchor: body, before: footer ?? body.lastElementChild };
-    },
-    getEditorRegion(editor) {
-      if (!editor) return null;
-      return editor.closest('.message-input-container') ?? defaultEditorRegion(editor);
-    },
-    getSendButton(editor, sendBtnSel) {
-      const region = (editor.closest('.message-input-container') ?? defaultEditorRegion(editor)) as Element | null;
-      if (region) {
-        const btn = region.querySelector<HTMLElement>('.message-input-right-button-send button.send-button, button.send-button');
-        if (btn && isVisibleElement(btn)) return btn;
-      }
-      return querySelectorFirst(sendBtnSel);
-    },
-  },
-  {
-    id: 'gemini',
-    matches: () => location.hostname.includes('gemini.google.com') || location.hostname.includes('aistudio.google.com'),
-    config: {
-      editor: 'div.ql-editor[contenteditable="true"]',
-      sendBtn: 'button.send-button[aria-label*="发送"], button.send-button[aria-label*="Send"]',
-      stopBtn: null,
-      fillMethod: 'execCommand',
-      useObserver: true,
-      responseSelector: 'model-response, .model-response-text, message-content',
-    },
-    getConversationId: defaultConversationId,
-    getSourceKey: defaultSourceKey,
-    isAssistantResponse: () => true,
-    shouldRenderToolText: () => true,
-    getToolCardMount: defaultToolMount,
-    getEditorRegion(editor) {
-      if (!editor) return null;
-      return findGeminiComposerRegion(editor) ?? defaultEditorRegion(editor);
-    },
-    getSendButton(editor, sendBtnSel) {
-      const region = findGeminiComposerRegion(editor) ?? editor.closest('form');
-      if (region) {
-        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
-          const btn = region.querySelector(sel) as HTMLElement | null;
-          if (btn && isVisibleElement(btn)) return btn;
-        }
-      }
-      return querySelectorFirst(sendBtnSel);
-    },
-  },
-  {
-    id: 'chatgpt',
-    matches: () => location.hostname === 'chatgpt.com' || location.hostname.endsWith('.chatgpt.com'),
-    config: {
-      editor: '#prompt-textarea.ProseMirror[contenteditable="true"], div.ProseMirror[contenteditable="true"][role="textbox"], #prompt-textarea',
-      sendBtn: 'button[aria-label="发送提示"], button[aria-label*="Send"], button[data-testid="send-button"]',
-      stopBtn: 'button[aria-label*="停止"], button[aria-label*="Stop"], button[data-testid="stop-button"]',
-      fillMethod: 'prosemirror',
-      useObserver: true,
-      responseSelector: '[data-message-author-role="assistant"] .markdown, [data-message-author-role="assistant"], article',
-    },
-    getConversationId() {
-      const m = location.pathname.match(/\/c\/([^/?#]+)/);
-      return m ? m[1] : defaultConversationId();
-    },
-    getSourceKey(sourceEl) {
-      const message = sourceEl?.closest('[data-message-id], [data-message-author-role="assistant"]');
-      const id = message?.getAttribute('data-message-id');
-      if (id) return id;
-      return defaultSourceKey(sourceEl);
-    },
-    isAssistantResponse(el) {
-      if (!el) return false;
-      const message = el.closest('[data-message-author-role]');
-      return message?.getAttribute('data-message-author-role') === 'assistant';
-    },
-    shouldRenderToolText(text, sourceEl) {
-      if (sourceEl?.closest('pre, code')) return false;
-      return text.replace(/\s+/g, ' ').includes('<tool');
-    },
-    getToolCardMount(sourceEl) {
-      const message = sourceEl.closest('[data-message-author-role="assistant"]');
-      if (message) return { anchor: message, before: message.lastElementChild };
-      return defaultToolMount(sourceEl);
-    },
-    getEditorRegion(editor) {
-      if (!editor) return null;
-      return editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor);
-    },
-    getSendButton(editor, sendBtnSel) {
-      const region = (editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor)) as Element | null;
-      if (region) {
-        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
-          const btn = region.querySelector<HTMLElement>(sel);
-          if (btn && isVisibleElement(btn) && !(btn as HTMLButtonElement).disabled) return btn;
-        }
-      }
-      const globalBtn = querySelectorFirst(sendBtnSel);
-      return globalBtn && isVisibleElement(globalBtn) && !(globalBtn as HTMLButtonElement).disabled ? globalBtn : null;
-    },
-  },
-  {
-    id: 'claude',
-    matches: () => location.hostname === 'claude.ai' || location.hostname.endsWith('.claude.ai'),
-    config: {
-      editor: 'div[contenteditable="true"][data-slate-editor="true"], div[contenteditable="true"][role="textbox"], div.ProseMirror[contenteditable="true"], textarea',
-      sendBtn: 'button[aria-label*="Send"], button[aria-label*="发送"], button[data-testid*="send"], button[type="submit"]',
-      stopBtn: 'button[aria-label*="Stop"], button[aria-label*="停止"]',
-      fillMethod: 'execCommand',
-      useObserver: true,
-      responseSelector: 'article, [data-testid*="assistant"], div.font-claude-message, div[class*="markdown"], div.prose',
-    },
-    getConversationId() {
-      const m = location.pathname.match(/\/chat\/([^/?#]+)/);
-      return m ? m[1] : defaultConversationId();
-    },
-    getSourceKey(sourceEl) {
-      const message = sourceEl?.closest('article, [data-testid*="message"], [data-testid*="assistant"]');
-      const id = message?.getAttribute('data-testid') || message?.getAttribute('id');
-      if (id) return id;
-      return defaultSourceKey(sourceEl);
-    },
-    isAssistantResponse(el) {
-      if (!el) return false;
-      if (el.closest('form, [contenteditable="true"], textarea')) return false;
-      const message = el.closest('article, [data-testid*="assistant"], [data-testid*="message"]');
-      if (!message) return false;
-      return !message.querySelector('textarea, [contenteditable="true"]');
-    },
-    shouldRenderToolText(text, sourceEl) {
-      if (sourceEl?.closest('pre, code')) return false;
-      return text.replace(/\s+/g, ' ').includes('<tool');
-    },
-    getToolCardMount(sourceEl) {
-      const message = sourceEl.closest('article, [data-testid*="assistant"], [data-testid*="message"]');
-      if (message) return { anchor: message, before: message.lastElementChild };
-      return defaultToolMount(sourceEl);
-    },
-    getEditorRegion(editor) {
-      if (!editor) return null;
-      return editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor);
-    },
-    getSendButton(editor, sendBtnSel) {
-      const region = (editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor)) as Element | null;
-      if (region) {
-        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
-          const btn = region.querySelector<HTMLElement>(sel);
-          if (btn && isVisibleElement(btn) && !(btn as HTMLButtonElement).disabled && btn.getAttribute('aria-disabled') !== 'true') return btn;
-        }
-      }
-      const globalBtn = querySelectorFirst(sendBtnSel);
-      return globalBtn && isVisibleElement(globalBtn) && !(globalBtn as HTMLButtonElement).disabled ? globalBtn : null;
-    },
-  },
-  {
-    id: 'kimi',
-    matches: () => location.hostname === 'www.kimi.com' || location.hostname.endsWith('.kimi.com') || location.hostname.endsWith('.moonshot.cn'),
-    config: {
-      editor: '.chat-input-editor[contenteditable="true"], div[contenteditable="true"][data-lexical-editor="true"], div[contenteditable="true"][role="textbox"]',
-      sendBtn: '.send-button-container, .send-button, button[aria-label*="Send"], button[aria-label*="发送"], button[type="submit"]',
-      stopBtn: null,
-      fillMethod: 'execCommand',
-      useObserver: true,
-      responseSelector: '.markdown, [class*="markdown"], [data-message-id] [class*="segment"], [data-message-id] [class*="text"]',
-    },
-    getConversationId: defaultConversationId,
-    getSourceKey(sourceEl) {
-      const message = sourceEl?.closest('[data-message-id]');
-      const id = message?.getAttribute('data-message-id');
-      if (id) return id;
-      return defaultSourceKey(sourceEl);
-    },
-    isAssistantResponse(el) {
-      if (!el) return false;
-      if (el.closest('[contenteditable="true"]')) return false;
-      const kimiAssistant = el.closest('.segment-assistant, .chat-content-item-assistant');
-      if (kimiAssistant) return !kimiAssistant.querySelector('[contenteditable="true"]');
-      const message = el.closest('[data-message-id]');
-      return !!message && !message.querySelector('[contenteditable="true"]');
-    },
-    shouldRenderToolText(text, sourceEl) {
-      if (sourceEl?.closest('pre, code')) return false;
-      return text.replace(/\s+/g, ' ').includes('<tool');
-    },
-    getToolCardMount(sourceEl) {
-      const message = sourceEl.closest('[data-message-id]');
-      if (message) return { anchor: message, before: message.lastElementChild };
-      return defaultToolMount(sourceEl);
-    },
-    getEditorRegion(editor) {
-      if (!editor) return null;
-      return editor.closest('form') ?? editor.closest('.chat-editor') ?? editor.closest('.chat-input') ?? defaultEditorRegion(editor);
-    },
-    getSendButton(editor, sendBtnSel) {
-      const region = (editor.closest('form') ?? editor.closest('.chat-editor') ?? editor.closest('.chat-input') ?? defaultEditorRegion(editor)) as Element | null;
-      if (region) {
-        const selectors = ['.send-button-container', ...sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)];
-        for (const sel of selectors) {
-          const btn = region.querySelector<HTMLElement>(sel);
-          if (btn && isVisibleElement(btn) && btn.getAttribute('aria-disabled') !== 'true') return btn;
-        }
-      }
-      return querySelectorFirst(sendBtnSel);
-    },
-  },
-  {
-    id: 'perplexity',
-    matches: () => location.hostname === 'www.perplexity.ai' || location.hostname === 'perplexity.ai',
-    config: {
-      editor: '#ask-input[contenteditable="true"], div[contenteditable="true"][data-lexical-editor="true"], textarea',
-      sendBtn: 'button[aria-label="Submit"], button[aria-label="Send"], button[type="submit"]',
-      stopBtn: 'button[aria-label*="Stop"], button[aria-label*="停止"]',
-      fillMethod: 'execCommand',
-      useObserver: true,
-      responseSelector: 'main .prose, article .prose, [class*="prose"]',
-    },
-    getConversationId: defaultConversationId,
-    getSourceKey(sourceEl) {
-      const article = sourceEl?.closest('article');
-      if (article?.id) return article.id;
-      return defaultSourceKey(sourceEl);
-    },
-    isAssistantResponse(el) {
-      if (!el) return false;
-      if (el.closest('form, [contenteditable="true"], textarea')) return false;
-      return !!el.closest('article, main');
-    },
-    shouldRenderToolText(text, sourceEl) {
-      if (sourceEl?.closest('pre, code')) return false;
-      return text.replace(/\s+/g, ' ').includes('<tool');
-    },
-    getToolCardMount(sourceEl) {
-      const article = sourceEl.closest('article');
-      if (article) return { anchor: article, before: article.lastElementChild };
-      return defaultToolMount(sourceEl);
-    },
-    getEditorRegion(editor) {
-      if (!editor) return null;
-      return editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor);
-    },
-    getSendButton(editor, sendBtnSel) {
-      const region = (editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? defaultEditorRegion(editor)) as Element | null;
-      if (region) {
-        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
-          const btn = region.querySelector<HTMLElement>(sel);
-          if (btn && isVisibleElement(btn) && btn.getAttribute('aria-disabled') !== 'true') return btn;
-        }
-      }
-      return querySelectorFirst(sendBtnSel);
-    },
-  },
-  {
-    id: 'glm-intl',
-    matches: () => location.hostname === 'chat.z.ai' || location.hostname.endsWith('.z.ai'),
-    config: {
-      editor: '#chat-input, textarea, div[contenteditable="true"][role="textbox"]',
-      sendBtn: '#send-message-button, button[type="submit"], button[aria-label*="Send"]',
-      stopBtn: null,
-      fillMethod: 'value',
-      useObserver: true,
-      responseSelector: 'article, [class*="markdown"], [data-testid*="assistant"], .prose',
-    },
-    getConversationId: defaultConversationId,
-    getSourceKey(sourceEl) {
-      const article = sourceEl?.closest('article, [data-testid*="assistant"], [data-testid*="message"]');
-      const id = article?.getAttribute('data-testid') || article?.getAttribute('id');
-      if (id) return id;
-      return defaultSourceKey(sourceEl);
-    },
-    isAssistantResponse(el) {
-      if (!el) return false;
-      if (el.closest('form, textarea, [contenteditable="true"]')) return false;
-      return !!el.closest('article, [data-testid*="assistant"], [data-testid*="message"]');
-    },
-    shouldRenderToolText(text, sourceEl) {
-      if (sourceEl?.closest('pre, code')) return false;
-      return text.replace(/\s+/g, ' ').includes('<tool');
-    },
-    getToolCardMount(sourceEl) {
-      const article = sourceEl.closest('article, [data-testid*="assistant"], [data-testid*="message"]');
-      if (article) return { anchor: article, before: article.lastElementChild };
-      return defaultToolMount(sourceEl);
-    },
-    getEditorRegion(editor) {
-      if (!editor) return null;
-      return editor.closest('form') ?? editor.closest('[class*="input"]') ?? defaultEditorRegion(editor);
-    },
-    getSendButton(editor, sendBtnSel) {
-      const region = (editor.closest('form') ?? editor.closest('[class*="input"]') ?? defaultEditorRegion(editor)) as Element | null;
-      if (region) {
-        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
-          const btn = region.querySelector<HTMLElement>(sel);
-          if (btn && isVisibleElement(btn) && btn.getAttribute('aria-disabled') !== 'true') return btn;
-        }
-      }
-      return querySelectorFirst(sendBtnSel);
-    },
-  },
-  {
-    id: 'default',
-    matches: () => true,
-    config: {
-      editor: 'textarea[placeholder*="Start typing a prompt"]',
-      sendBtn: 'button.ctrl-enter-submits.ms-button-primary[type="submit"], button[aria-label*="Run"]',
-      stopBtn: null,
-      fillMethod: 'value',
-      useObserver: true,
-      responseSelector: 'ms-chat-turn',
-    },
-    getConversationId: defaultConversationId,
-    getSourceKey: defaultSourceKey,
-    isAssistantResponse: () => true,
-    shouldRenderToolText: () => true,
-    getToolCardMount: defaultToolMount,
-    getEditorRegion: defaultEditorRegion,
-    getSendButton(editor, sendBtnSel) {
-      const form = editor.closest('form');
-      if (form) {
-        for (const sel of sendBtnSel.split(',').map(s => s.trim()).filter(Boolean)) {
-          const btn = form.querySelector(sel) as HTMLElement | null;
-          if (btn && isVisibleElement(btn)) return btn;
-        }
-      }
-      return querySelectorFirst(sendBtnSel);
-    },
-  },
-];
+const {
+  getBrowserTextResponseText,
+  getDeepSeekLatestResponseState,
+  getBrowserTextResponseDebugSummary,
+  isDeepSeekResponseComplete,
+  getKimiLatestResponseState,
+  isKimiResponseComplete,
+  isQwenResponseComplete: isBrowserTextQwenResponseComplete,
+} = createBrowserTextResponse({
+  getSiteAdapter,
+  getQwenLatestResponseState,
+  isQwenResponseComplete,
+});
 
 function getSiteAdapter(): SiteAdapter {
   return siteAdapters.find((adapter) => adapter.matches())!;
@@ -682,11 +138,6 @@ function getSiteConfig(): SiteConfig {
   return getSiteAdapter().config;
 }
 
-const DEBUG_LOG_LIMIT = 200;
-let debugModeEnabled = false;
-let debugLogSeq = 0;
-let debugPanelLogEl: HTMLPreElement | null = null;
-const debugLogs: string[] = [];
 let labsFxAPIHeaders: Record<string, string> = {};
 let labsFxProjectId = '';
 let labsFxReferencesInjectedReady = false;
@@ -694,11 +145,6 @@ let labsFxGeneratePatchedSeq = 0;
 let labsFxVideoStatusSeq = 0;
 let labsFxLatestVideoStatus = '';
 let labsFxLatestVideoError = '';
-let geminiLatestMediaURLs: string[] = [];
-let geminiMediaSeq = 0;
-let geminiReferenceAttachSeq = 0;
-let extensionContextInvalidated = false;
-let extensionContextInvalidatedLogged = false;
 const browserTextWorkerID = getOrCreateBrowserTextWorkerID();
 const browserTextWorkerSites = new Set(['gemini', 'chatgpt', 'claude', 'kimi', 'perplexity', 'glm-intl', 'qwen', 'deepseek', 'doubao']);
 const browserTextWorkerStarted = new Set<string>();
@@ -706,26 +152,22 @@ let manualBrowserTextEndSeq = 0;
 
 type BrowserTextChunkReporter = (content: string, metadata: Record<string, string>) => Promise<void>;
 
-function formatDebugValue(value: unknown): string {
-  if (value == null) return '';
-  if (typeof value === 'string') return value;
-  try { return JSON.stringify(value); } catch { return String(value); }
-}
-
-function refreshDebugLogView() {
-  if (!debugPanelLogEl) return;
-  debugPanelLogEl.textContent = debugLogs.join('\n');
-  debugPanelLogEl.scrollTop = debugPanelLogEl.scrollHeight;
-}
-
-function debugLog(message: string, data?: unknown) {
-  const suffix = formatDebugValue(data);
-  const line = `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })} #${++debugLogSeq}] ${message}${suffix ? ` ${suffix}` : ''}`;
-  console.log('[OpenLink][Debug]', message, data ?? '');
-  debugLogs.push(line);
-  if (debugLogs.length > DEBUG_LOG_LIMIT) debugLogs.splice(0, debugLogs.length - DEBUG_LOG_LIMIT);
-  if (debugModeEnabled) refreshDebugLogView();
-}
+const { mountDebugUi } = createDebugPanelController({
+  sendInitPrompt,
+  getSiteConfig,
+  getSiteAdapter,
+  getCurrentEditor,
+  getEditorCandidates,
+  getVisibleTextareas,
+  getEditorRegion,
+  getLabsFxDebugState: () => ({
+    projectId: labsFxProjectId,
+    apiHeaderKeys: Object.keys(labsFxAPIHeaders),
+  }),
+  registerBrowserTextWorker,
+  markBrowserTextResponseEnded,
+  showToast,
+});
 
 function getOrCreateBrowserTextWorkerID(): string {
   const key = 'openlink_browser_text_worker_id';
@@ -882,12 +324,11 @@ if (!(window as any).__OPENLINK_LOADED__) {
         error: labsFxLatestVideoError ? labsFxLatestVideoError.slice(0, 240) : '',
       });
     } else if (event.data.type === 'OPENLINK_GEMINI_MEDIA_FOUND') {
-      geminiLatestMediaURLs = Array.isArray(event.data.data?.urls) ? event.data.data.urls : [];
-      geminiMediaSeq += 1;
+      const mediaState = recordGeminiMediaCapture(Array.isArray(event.data.data?.urls) ? event.data.data.urls : []);
       debugLog('gemini 已捕获无水印媒体 URL', {
-        seq: geminiMediaSeq,
-        count: geminiLatestMediaURLs.length,
-        first: geminiLatestMediaURLs[0] || '',
+        seq: mediaState.seq,
+        count: mediaState.urls.length,
+        first: mediaState.urls[0] || '',
       });
     } else if (event.data.type === 'OPENLINK_GEMINI_ATTACH_REFERENCE_RESULT') {
       debugLog('[injected] gemini 页面内参考图注入结果', event.data.data || {});
@@ -914,29 +355,22 @@ if (!(window as any).__OPENLINK_LOADED__) {
     return true;
   });
 
-  const mountDebugUi = () => {
-    injectInitButton();
-    debugModeEnabled = debugMode;
-    if (debugMode) injectDebugPanel();
-    else removeDebugPanel();
-  };
-
   chrome.storage.local.get(['debugMode']).then((result) => {
     debugMode = !!result.debugMode;
-    debugModeEnabled = debugMode;
+    setDebugModeEnabled(debugMode);
     debugLog('调试模式状态初始化', { enabled: debugMode });
-    if (document.body) mountDebugUi();
+    if (document.body) mountDebugUi(debugMode);
   });
   chrome.storage.onChanged.addListener((changes) => {
     if ('debugMode' in changes) {
       debugMode = !!changes.debugMode.newValue;
-      debugModeEnabled = debugMode;
+      setDebugModeEnabled(debugMode);
       debugLog('调试模式状态变更', { enabled: debugMode });
-      if (document.body) mountDebugUi();
+      if (document.body) mountDebugUi(debugMode);
     }
   });
 
-  if (!document.body) document.addEventListener('DOMContentLoaded', mountDebugUi);
+  if (!document.body) document.addEventListener('DOMContentLoaded', () => mountDebugUi(debugMode));
 
   if (document.body) mountInputListener();
   else document.addEventListener('DOMContentLoaded', mountInputListener);
@@ -1003,531 +437,27 @@ function hashStr(s: string): number {
 
 function getConversationId(): string { return getSiteAdapter().getConversationId(); }
 
-function getSourceKey(sourceEl?: Element): string { return getSiteAdapter().getSourceKey(sourceEl); }
-
-function isExecuted(key: string): boolean {
-  try {
-    const store: Record<string, number> = JSON.parse(localStorage.getItem('openlink_executed') || '{}');
-    return !!store[key];
-  } catch { return false; }
-}
-
-const TTL = 7 * 24 * 60 * 60 * 1000;
-
-function markExecuted(key: string): void {
-  try {
-    const store: Record<string, number> = JSON.parse(localStorage.getItem('openlink_executed') || '{}');
-    const now = Date.now();
-    for (const k of Object.keys(store)) {
-      if (now - store[k] > TTL) delete store[k];
-    }
-    store[key] = now;
-    localStorage.setItem('openlink_executed', JSON.stringify(store));
-  } catch {}
-}
-
-async function executeToolCallRaw(toolCall: any): Promise<string> {
-  const { authToken, apiUrl } = await chrome.storage.local.get(['authToken', 'apiUrl']);
-  if (!apiUrl) return '请先在插件中配置 API 地址';
-  const headers: any = { 'Content-Type': 'application/json' };
-  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-  const response = await bgFetch(`${apiUrl}/exec`, { method: 'POST', headers, body: JSON.stringify(toolCall) });
-  if (response.status === 401) return '认证失败，请在插件中重新输入 Token';
-  if (!response.ok) return `[OpenLink 错误] HTTP ${response.status}`;
-  const result = JSON.parse(response.body);
-  return result.output || result.error || '[OpenLink] 空响应';
-}
-
-function getToolCardMount(sourceEl: Element): { anchor: Element; before: Element | null } | null {
-  return getSiteAdapter().getToolCardMount(sourceEl);
-}
-
-function isAssistantResponse(el: Element | null): boolean {
-  return getSiteAdapter().isAssistantResponse(el);
-}
-
-function shouldRenderToolText(text: string, sourceEl?: Element): boolean {
-  return getSiteAdapter().shouldRenderToolText(text, sourceEl);
-}
-
-function renderToolCard(data: any, _full: string, sourceEl: Element, key: string, processed: Set<string>) {
-  const mount = getToolCardMount(sourceEl);
-  if (!mount) return;
-  const { anchor, before } = mount;
-
-  // Prevent duplicate cards
-  if (anchor.querySelector(`[data-openlink-key="${key}"]`)) return;
-
-  const args = data.args || {};
-  const card = document.createElement('div');
-  card.setAttribute('data-openlink-key', key);
-  card.style.cssText = 'border:1px solid #444;border-radius:8px;padding:12px;margin:8px 0;background:#1e1e2e;color:#cdd6f4;font-size:13px';
-
-  const header = document.createElement('div');
-  header.style.cssText = 'font-weight:bold;margin-bottom:8px';
-  header.innerHTML = `🔧 ${data.name} <span style="color:#888;font-size:11px">#${data.callId || ''}</span>`;
-  card.appendChild(header);
-
-  const argsBox = document.createElement('div');
-  argsBox.style.cssText = 'margin:8px 0;background:#181825;border-radius:6px;padding:8px';
-  for (const [k, v] of Object.entries(args)) {
-    const row = document.createElement('div');
-    row.style.cssText = 'margin-bottom:4px';
-    row.innerHTML = `<span style="color:#89b4fa;font-size:11px">${k}</span>`;
-    const val = document.createElement('div');
-    val.style.cssText = 'color:#cdd6f4;font-size:12px;font-family:monospace;white-space:pre-wrap;max-height:80px;overflow-y:auto';
-    val.textContent = typeof v === 'string' ? v : JSON.stringify(v);
-    row.appendChild(val);
-    argsBox.appendChild(row);
-  }
-  card.appendChild(argsBox);
-
-  const btnRow = document.createElement('div');
-  btnRow.style.cssText = 'display:flex;gap:8px';
-  const execBtn = document.createElement('button');
-  execBtn.textContent = '执行';
-  execBtn.style.cssText = 'padding:4px 12px;background:#1677ff;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px';
-  const skipBtn = document.createElement('button');
-  skipBtn.textContent = '忽略';
-  skipBtn.style.cssText = 'padding:4px 12px;background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;cursor:pointer;font-size:12px';
-  btnRow.appendChild(execBtn);
-  btnRow.appendChild(skipBtn);
-  card.appendChild(btnRow);
-
-  execBtn.onclick = async () => {
-    execBtn.disabled = true;
-    execBtn.textContent = '执行中...';
-    markExecuted(key);
-    try {
-      const text = await executeToolCallRaw(data);
-      const resultBox = document.createElement('div');
-      resultBox.style.cssText = 'margin-top:10px;background:#181825;border-radius:6px;padding:8px;max-height:200px;overflow-y:auto;font-family:monospace;font-size:12px;color:#cdd6f4;white-space:pre-wrap';
-      resultBox.textContent = text;
-      const insertBtn = document.createElement('button');
-      insertBtn.type = 'button';
-      insertBtn.textContent = '插入到对话';
-      insertBtn.style.cssText = 'margin-top:6px;padding:4px 12px;background:#313244;color:#89b4fa;border:1px solid #89b4fa;border-radius:6px;cursor:pointer;font-size:12px';
-      insertBtn.onclick = () => fillAndSend(text, true);
-      card.appendChild(resultBox);
-      card.appendChild(insertBtn);
-      execBtn.textContent = '✅ 已执行';
-    } catch {
-      execBtn.textContent = '❌ 执行失败';
-      execBtn.disabled = false;
-    }
-  };
-
-  skipBtn.onclick = () => { card.remove(); processed.delete(key); };
-
-  if (before) anchor.insertBefore(card, before);
-  else anchor.appendChild(card);
-}
-
-function startDOMObserver(responseSelector: string) {
-  const processed = new Set<string>();
-  const TOOL_RE = /<tool(?:\s[^>]*)?>[\s\S]*?<\/tool>/g;
-  const responseSelectors = responseSelector.split(',').map(s => s.trim()).filter(Boolean);
-  let autoExecute = false;
-  chrome.storage.local.get(['autoExecute']).then(r => { autoExecute = !!r.autoExecute; });
-  chrome.storage.onChanged.addListener((changes) => {
-    if ('autoExecute' in changes) autoExecute = !!changes.autoExecute.newValue;
-  });
-
-  function scanText(text: string, sourceEl?: Element) {
-    if (!text.includes('<tool')) return;
-    if (sourceEl && !isAssistantResponse(sourceEl)) return;
-    if (!shouldRenderToolText(text, sourceEl)) return;
-    TOOL_RE.lastIndex = 0;
-    let match;
-    while ((match = TOOL_RE.exec(text)) !== null) {
-      const full = match[0];
-      const inner = full.replace(/^<tool[^>]*>|<\/tool>$/g, '').trim();
-      const data = parseXmlToolCall(full) || tryParseToolJSON(inner);
-      if (!data) { console.warn('[OpenLink] 工具调用解析失败:', full); continue; }
-      const convId = getConversationId();
-      const sourceKey = getSourceKey(sourceEl);
-      const key = data.callId ? `${convId}:${data.name}:${data.callId}` : `${convId}:${sourceKey}:${hashStr(full)}`;
-      if (processed.has(key)) continue;
-      console.log('[OpenLink] 提取到工具调用:', data);
-
-      if (sourceEl) {
-        processed.add(key);
-        renderToolCard(data, full, sourceEl, key, processed);
-        if (autoExecute && !isExecuted(key)) {
-          markExecuted(key);
-          window.postMessage({ type: 'TOOL_CALL', data }, '*');
-        }
-      } else {
-        if (isExecuted(key)) continue;
-        processed.add(key);
-        markExecuted(key);
-        window.postMessage({ type: 'TOOL_CALL', data }, '*');
-      }
-    }
-  }
-
-  function scanNode(node: Node) {
-    let el: Element | null;
-    if (node.nodeType === Node.TEXT_NODE) {
-      el = (node as Text).parentElement;
-    } else if (node.nodeType === Node.ELEMENT_NODE) {
-      el = node as Element;
-    } else {
-      return;
-    }
-    if (!el) return;
-    const mc = findResponseContainer(el);
-    if (mc) scheduleScan(mc);
-  }
-
-  function findResponseContainer(el: Element | null): Element | null {
-    while (el) {
-      if (responseSelectors.some(sel => {
-        try { return el!.matches(sel); } catch { return false; }
-      }) && isAssistantResponse(el)) return el;
-      el = el.parentElement;
-    }
-    return null;
-  }
-
-  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  let maxWaitTimer: ReturnType<typeof setTimeout> | null = null;
-  const pendingContainers = new Set<Element>();
-
-  // 块级标签：遍历到这些元素时在前面插入换行
-  const BLOCK_TAGS = new Set(['P', 'DIV', 'BR', 'LI', 'TR', 'PRE', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
-
-  // 跳过这些元素及其子树（UI 噪声）
-  const SKIP_TAGS = new Set(['MS-THOUGHT-CHUNK', 'MAT-ICON', 'SCRIPT', 'STYLE', 'BUTTON', 'MAT-EXPANSION-PANEL-HEADER']);
-
-  function extractText(node: Node, buf: string[]): void {
-    if (node.nodeType === Node.TEXT_NODE) {
-      buf.push(node.textContent || '');
-      return;
-    }
-    if (node.nodeType !== Node.ELEMENT_NODE) return;
-    const el = node as Element;
-
-    // 跳过 aria-hidden 元素（Material Icons 图标文字）和噪声标签
-    if (el.getAttribute('aria-hidden') === 'true') return;
-    if (SKIP_TAGS.has(el.tagName)) return;
-
-    // 块级元素前插换行，保证多行结构
-    if (BLOCK_TAGS.has(el.tagName)) buf.push('\n');
-
-    for (const child of el.childNodes) {
-      extractText(child, buf);
-    }
-  }
-
-  function getCleanText(el: Element): string {
-    const buf: string[] = [];
-    extractText(el, buf);
-    return buf.join('');
-  }
-
-  function scheduleScan(container: Element) {
-    pendingContainers.add(container);
-    if (!maxWaitTimer) {
-      maxWaitTimer = setTimeout(() => {
-        maxWaitTimer = null;
-        if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
-        const els = [...pendingContainers];
-        pendingContainers.clear();
-        requestAnimationFrame(() => {
-          for (const el of els) scanText(getCleanText(el), el);
-        });
-      }, 3000);
-    }
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      debounceTimer = null;
-      if (maxWaitTimer) { clearTimeout(maxWaitTimer); maxWaitTimer = null; }
-      const els = [...pendingContainers];
-      pendingContainers.clear();
-      requestAnimationFrame(() => {
-        for (const el of els) scanText(getCleanText(el), el);
-      });
-    }, 800);
-  }
-
-  new MutationObserver(mutations => {
-    for (const mutation of mutations) {
-      if (mutation.type === 'characterData') {
-        const container = findResponseContainer((mutation.target as Text).parentElement);
-        if (container) scheduleScan(container);
-      } else {
-        mutation.addedNodes.forEach(scanNode);
-      }
-    }
-  }).observe(document.body, { childList: true, subtree: true, characterData: true });
-
-  // Initial scan for already-rendered tool calls (e.g. after page refresh)
-  requestAnimationFrame(() => {
-    document.querySelectorAll(responseSelector).forEach(el => {
-      if (!isAssistantResponse(el)) return;
-      scanText(getCleanText(el), el);
-    });
-  });
-}
-
-function injectFloatingButton(id: string, label: string, bottom: number, background: string, onClick: () => void | Promise<void>) {
-  document.getElementById(id)?.remove();
-  const btn = document.createElement('button');
-  btn.id = id;
-  btn.type = 'button';
-  btn.textContent = label;
-  btn.style.cssText = `position:fixed;bottom:${bottom}px;right:20px;z-index:99999;padding:8px 14px;background:${background};color:#fff;border:none;border-radius:20px;cursor:pointer;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,0.3)`;
-  btn.onclick = () => { void onClick(); };
-  document.body.appendChild(btn);
-}
-
-function injectInitButton() {
-  injectFloatingButton('openlink-init-btn', '🔗 初始化', 80, '#1677ff', sendInitPrompt);
-}
-
-function removeDebugPanel() {
-  document.getElementById('openlink-debug-panel')?.remove();
-  debugPanelLogEl = null;
-}
-
-function shortenHtml(html: string, max = 4000): string {
-  return html.length > max ? `${html.slice(0, max)}\n...[truncated ${html.length - max} chars]` : html;
-}
-
-function elementSnapshot(el: Element | null) {
-  if (!el) return null;
-  const htmlEl = el as HTMLElement;
-  const rect = htmlEl.getBoundingClientRect();
-  return {
-    tag: el.tagName.toLowerCase(),
-    id: el.id || '',
-    className: el.className || '',
-    name: el.getAttribute('name') || '',
-    placeholder: el.getAttribute('placeholder') || '',
-    type: el.getAttribute('type') || '',
-    ariaLabel: el.getAttribute('aria-label') || '',
-    readOnly: htmlEl instanceof HTMLTextAreaElement ? htmlEl.readOnly : false,
-    disabled: htmlEl instanceof HTMLButtonElement || htmlEl instanceof HTMLTextAreaElement ? htmlEl.disabled : false,
-    value: htmlEl instanceof HTMLTextAreaElement ? htmlEl.value : '',
-    text: (htmlEl.innerText || '').slice(0, 500),
-    rect: { top: rect.top, left: rect.left, width: rect.width, height: rect.height },
-    outerHTML: shortenHtml(el.outerHTML || ''),
-  };
-}
-
 function getEditorRegion(editor: Element | null): Element | null { return getSiteAdapter().getEditorRegion(editor); }
 
-function getNearbyButtons(editor: Element | null): Element[] {
-  const region = getEditorRegion(editor);
-  if (!region) return [];
-  return Array.from(region.querySelectorAll('button, [role="button"]')).slice(0, 12);
-}
+async function fetchLabsFxGeneratedMedia(mediaKind: 'image' | 'video', mediaEl: HTMLImageElement | HTMLVideoElement, absoluteUrl: string): Promise<MediaBinaryResponse> {
+  const mediaResp = await bgFetchBinary(absoluteUrl, {
+    credentials: 'omit',
+    redirect: 'follow',
+    referrer: location.origin,
+    referrerPolicy: 'no-referrer-when-downgrade',
+  });
+  if (mediaResp.ok && mediaResp.bodyBase64) return mediaResp;
 
-function collectDebugData() {
-  const cfg = getSiteConfig();
-  const editorCandidates = getEditorCandidates(cfg.editor);
-  const visibleTextareas = getVisibleTextareas();
-  const currentEditor = getCurrentEditor(cfg.editor);
-  const editorRegion = getEditorRegion(currentEditor);
-  const sendButtons = Array.from(document.querySelectorAll(cfg.sendBtn.split(',').map(s => s.trim()).filter(Boolean).join(',')));
-  const responseNodes = cfg.responseSelector ? Array.from(document.querySelectorAll(cfg.responseSelector)).slice(-3) : [];
-  const toolNodes = Array.from(document.querySelectorAll('.prose, message-content, ms-chat-turn'))
-    .filter((el) => (el.textContent || '').includes('<tool'))
-    .slice(-3);
-  return {
-    capturedAt: new Date().toISOString(),
-    location: { href: location.href, hostname: location.hostname, pathname: location.pathname },
-    adapterId: getSiteAdapter().id,
-    siteConfig: cfg,
-    activeElement: elementSnapshot(document.activeElement as Element | null),
-    currentEditor: elementSnapshot(currentEditor),
-    editorRegion: elementSnapshot(editorRegion),
-    visibleTextareaCount: visibleTextareas.length,
-    editorCandidateCount: editorCandidates.length,
-    visibleTextareas: visibleTextareas.map((el) => elementSnapshot(el)),
-    editorCandidates: editorCandidates.map((el) => elementSnapshot(el)),
-    sendButtons: sendButtons.map((el) => elementSnapshot(el)),
-    nearbyButtons: getNearbyButtons(currentEditor).map((el) => elementSnapshot(el)),
-    latestResponses: responseNodes.map((el) => elementSnapshot(el)),
-    latestToolContainers: toolNodes.map((el) => elementSnapshot(el)),
-    labsFxProjectId,
-    labsFxAPIHeaderKeys: Object.keys(labsFxAPIHeaders),
-    debugLogs: [...debugLogs],
-  };
-}
-
-async function copyText(text: string) {
-  await navigator.clipboard.writeText(text);
-  showToast('已复制到剪贴板', 2000);
-}
-
-function downloadText(filename: string, text: string) {
-  const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-  showToast(`已下载 ${filename}`, 2000);
-}
-
-function injectDebugPanel() {
-  if (document.getElementById('openlink-debug-panel')) return;
-  const panel = document.createElement('div');
-  panel.id = 'openlink-debug-panel';
-  panel.style.cssText = 'position:fixed;bottom:180px;right:20px;z-index:99999;width:320px;max-height:70vh;background:#111827;color:#f3f4f6;border:1px solid #374151;border-radius:12px;padding:10px;box-shadow:0 8px 24px rgba(0,0,0,0.35);font-size:12px;display:flex;flex-direction:column';
-
-  const title = document.createElement('div');
-  title.textContent = 'OpenLink 调试模式';
-  title.style.cssText = 'font-weight:700;margin-bottom:8px';
-  panel.appendChild(title);
-
-  const actions: Array<{ label: string; onClick: () => void | Promise<void> }> = [
-    {
-      label: '复制调试 JSON',
-      onClick: () => copyText(JSON.stringify(collectDebugData(), null, 2)),
-    },
-    {
-      label: '下载调试 JSON',
-      onClick: () => {
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-        downloadText(`openlink-debug-${stamp}.json`, JSON.stringify(collectDebugData(), null, 2));
-      },
-    },
-    {
-      label: '复制当前输入框 HTML',
-      onClick: () => copyText((collectDebugData().currentEditor?.outerHTML) || ''),
-    },
-    {
-      label: '复制当前输入区 HTML',
-      onClick: () => copyText((collectDebugData().editorRegion?.outerHTML) || ''),
-    },
-    {
-      label: '复制候选发送按钮 HTML',
-      onClick: () => {
-        const html = collectDebugData().nearbyButtons.map((item) => item?.outerHTML || '').join('\n\n');
-        void copyText(html);
-      },
-    },
-    {
-      label: '复制最近回复 HTML',
-      onClick: () => {
-        const last = collectDebugData().latestResponses.at(-1);
-        void copyText(last?.outerHTML || '');
-      },
-    },
-    {
-      label: '复制调试日志',
-      onClick: () => copyText(debugLogs.join('\n')),
-    },
-    {
-      label: '清空调试日志',
-      onClick: () => {
-        debugLogs.length = 0;
-        refreshDebugLogView();
-        showToast('已清空调试日志', 2000);
-      },
-    },
-    {
-      label: '手动注册文本 worker',
-      onClick: async () => {
-        try {
-          const payload = await registerBrowserTextWorker('debug-panel');
-          showToast(`文本 worker 已注册: ${JSON.stringify(payload).slice(0, 120)}`, 3500);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          debugLog('手动注册文本 worker 失败', { error: message });
-          showToast(`注册失败: ${message}`, 5000);
-        }
-      },
-    },
-    {
-      label: '标记 AI 响应结束',
-      onClick: () => markBrowserTextResponseEnded('debug-panel'),
-    },
-  ];
-
-  for (const action of actions) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.textContent = action.label;
-    btn.style.cssText = 'display:block;width:100%;margin-top:6px;padding:7px 10px;background:#1f2937;color:#f9fafb;border:1px solid #4b5563;border-radius:8px;cursor:pointer;text-align:left';
-    btn.onclick = () => { void action.onClick(); };
-    panel.appendChild(btn);
+  if (mediaKind === 'image' && mediaEl instanceof HTMLImageElement) {
+    debugLog('labsfx 图片 fetch 失败，回退 canvas 导出', {
+      status: mediaResp.status,
+      error: mediaResp.error || '',
+      url: absoluteUrl,
+    });
+    return canvasImageToMediaResponse(mediaEl, absoluteUrl);
   }
 
-  const hint = document.createElement('div');
-  hint.textContent = '用于抓取站点兼容信息';
-  hint.style.cssText = 'margin-top:8px;color:#9ca3af;line-height:1.4';
-  panel.appendChild(hint);
-
-  const logTitle = document.createElement('div');
-  logTitle.textContent = '实时日志';
-  logTitle.style.cssText = 'margin-top:8px;margin-bottom:6px;font-weight:700';
-  panel.appendChild(logTitle);
-
-  const logBox = document.createElement('pre');
-  logBox.style.cssText = 'margin:0;flex:1;min-height:180px;max-height:260px;overflow:auto;background:#030712;border:1px solid #374151;border-radius:8px;padding:8px;color:#d1fae5;font-size:11px;line-height:1.45;white-space:pre-wrap;word-break:break-word';
-  panel.appendChild(logBox);
-  debugPanelLogEl = logBox;
-  refreshDebugLogView();
-
-  document.body.appendChild(panel);
-  debugLog('调试面板已挂载');
-}
-
-async function bgFetch(url: string, options?: any): Promise<{ ok: boolean; status: number; body: string }> {
-  assertExtensionContextActive();
-  try {
-    return await chrome.runtime.sendMessage({ type: 'FETCH', url, options });
-  } catch (error) {
-    handleExtensionContextError(error);
-    throw error;
-  }
-}
-
-async function bgFetchBinary(url: string, options?: any): Promise<{ ok: boolean; status: number; bodyBase64: string; contentType: string; finalUrl: string; error?: string }> {
-  assertExtensionContextActive();
-  try {
-    return await chrome.runtime.sendMessage({ type: 'FETCH_BINARY', url, options });
-  } catch (error) {
-    handleExtensionContextError(error);
-    throw error;
-  }
-}
-
-function isExtensionContextInvalidatedError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error || '');
-  return message.includes('Extension context invalidated');
-}
-
-function handleExtensionContextError(error: unknown) {
-  if (!isExtensionContextInvalidatedError(error)) return;
-  extensionContextInvalidated = true;
-  if (!extensionContextInvalidatedLogged) {
-    extensionContextInvalidatedLogged = true;
-    debugLog('扩展上下文已失效，停止后台轮询，刷新页面或重载扩展后恢复');
-  }
-}
-
-function assertExtensionContextActive() {
-  if (extensionContextInvalidated || !chrome?.runtime?.id) {
-    const error = new Error('Extension context invalidated');
-    handleExtensionContextError(error);
-    throw error;
-  }
-}
-
-async function getStoredConfig(keys: string[]) {
-  assertExtensionContextActive();
-  try {
-    return await chrome.storage.local.get(keys);
-  } catch (error) {
-    handleExtensionContextError(error);
-    throw error;
-  }
+  return mediaResp;
 }
 
 let labsFxWorkerStarted = false;
@@ -1540,7 +470,7 @@ function startLabsFxImageWorker() {
   let stopped = false;
 
   const tick = async () => {
-    if (running || stopped || extensionContextInvalidated) return;
+    if (running || stopped || isExtensionContextInvalidated()) return;
     running = true;
     try {
       const { authToken, apiUrl } = await getStoredConfig(['authToken', 'apiUrl']);
@@ -1578,7 +508,7 @@ function startLabsFxImageWorker() {
       }
     } catch (err) {
       handleExtensionContextError(err);
-      if (extensionContextInvalidated) {
+      if (isExtensionContextInvalidated()) {
         stopped = true;
         return;
       }
@@ -1591,7 +521,7 @@ function startLabsFxImageWorker() {
 
   void tick();
   const intervalId = window.setInterval(() => {
-    if (stopped || extensionContextInvalidated) {
+    if (stopped || isExtensionContextInvalidated()) {
       window.clearInterval(intervalId);
       return;
     }
@@ -1644,13 +574,23 @@ async function runLabsFxMediaJob(job: any, apiUrl: string, authToken: string) {
     }
   }
 
-  const mediaEl = await waitForNewLabsFxGeneratedMedia(mediaKind, beforeKeys, mediaKind === 'video' ? 25 * 60 * 1000 : 180000, beforeVideoStatusSeq);
-  const src = mediaEl.getAttribute('src');
+  const mediaEl = await waitForNewLabsFxGeneratedMedia(
+    mediaKind,
+    beforeKeys,
+    mediaKind === 'video' ? 25 * 60 * 1000 : 180000,
+    beforeVideoStatusSeq,
+    () => ({
+      seq: labsFxVideoStatusSeq,
+      status: labsFxLatestVideoStatus,
+      error: labsFxLatestVideoError,
+    })
+  );
+  const src = mediaEl.getAttribute('src') || mediaEl.currentSrc;
   if (!src) throw new Error(`generated ${mediaKind} src missing`);
   debugLog(`labsfx 检测到新${mediaKind === 'video' ? '视频' : '图片'}`, { src });
 
   const absoluteUrl = new URL(src, location.href).toString();
-  const mediaResp = await bgFetchBinary(absoluteUrl, { credentials: 'include' });
+  const mediaResp = await fetchLabsFxGeneratedMedia(mediaKind, mediaEl, absoluteUrl);
   if (!mediaResp.ok || !mediaResp.bodyBase64) throw new Error(`${mediaKind} fetch failed: HTTP ${mediaResp.status}${mediaResp.error ? ` ${mediaResp.error}` : ''}`);
   debugLog(`labsfx ${mediaKind === 'video' ? '视频' : '图片'}抓取成功`, { status: mediaResp.status, url: absoluteUrl, finalUrl: mediaResp.finalUrl, contentType: mediaResp.contentType });
   const base64 = mediaResp.bodyBase64;
@@ -1680,7 +620,7 @@ function startGeminiImageWorker() {
   debugLog('gemini 图片 worker 已启动');
 
   const tick = async () => {
-    if (running || stopped || extensionContextInvalidated) return;
+    if (running || stopped || isExtensionContextInvalidated()) return;
     running = true;
     try {
       const { authToken, apiUrl } = await getStoredConfig(['authToken', 'apiUrl']);
@@ -1718,7 +658,7 @@ function startGeminiImageWorker() {
       }
     } catch (err) {
       handleExtensionContextError(err);
-      if (extensionContextInvalidated) {
+      if (isExtensionContextInvalidated()) {
         stopped = true;
         return;
       }
@@ -1731,7 +671,7 @@ function startGeminiImageWorker() {
 
   void tick();
   const intervalId = window.setInterval(() => {
-    if (stopped || extensionContextInvalidated) {
+    if (stopped || isExtensionContextInvalidated()) {
       window.clearInterval(intervalId);
       return;
     }
@@ -1745,7 +685,7 @@ async function runGeminiImageJob(job: any, apiUrl: string, authToken: string) {
     const referenceImages = Array.isArray(job.reference_images) ? job.reference_images : [];
     showToast(`Gemini 开始处理图片: ${job.id}`, 2500);
     debugLog('gemini 开始执行图片任务', { id: job.id, referenceCount: referenceImages.length });
-    geminiLatestMediaURLs = [];
+    resetGeminiMediaCapture();
     let editor = await waitForElement<HTMLElement>('div.ql-editor[contenteditable="true"]', 20000);
     debugLog('gemini 已定位输入框');
     await clearGeminiReferenceImages(editor);
@@ -1765,7 +705,7 @@ async function runGeminiImageJob(job: any, apiUrl: string, authToken: string) {
       debugLog('gemini 本次任务无参考图');
     }
     const beforeKeys = getGeminiImageKeys();
-    const beforeMediaSeq = geminiMediaSeq;
+    const beforeMediaSeq = getGeminiMediaSeq();
     debugLog('gemini 提交前图片 key 集合', beforeKeys);
     await setGeminiPrompt(editor, String(job.prompt));
     debugLog('gemini Prompt 已写入', { prompt: String(job.prompt).slice(0, 120), editorText: getEditorText(editor).slice(0, 120) });
@@ -1829,7 +769,7 @@ function startChatGPTImageWorker() {
   debugLog('chatgpt 图片 worker 已启动');
 
   const tick = async () => {
-    if (running || stopped || extensionContextInvalidated) return;
+    if (running || stopped || isExtensionContextInvalidated()) return;
     running = true;
     try {
       const { authToken, apiUrl } = await getStoredConfig(['authToken', 'apiUrl']);
@@ -1867,7 +807,7 @@ function startChatGPTImageWorker() {
       }
     } catch (err) {
       handleExtensionContextError(err);
-      if (extensionContextInvalidated) {
+      if (isExtensionContextInvalidated()) {
         stopped = true;
         return;
       }
@@ -1880,7 +820,7 @@ function startChatGPTImageWorker() {
 
   void tick();
   const intervalId = window.setInterval(() => {
-    if (stopped || extensionContextInvalidated) {
+    if (stopped || isExtensionContextInvalidated()) {
       window.clearInterval(intervalId);
       return;
     }
@@ -1964,7 +904,7 @@ function startQwenImageWorker() {
   debugLog('qwen 图片 worker 已启动');
 
   const tick = async () => {
-    if (running || stopped || extensionContextInvalidated) return;
+    if (running || stopped || isExtensionContextInvalidated()) return;
     running = true;
     try {
       const { authToken, apiUrl } = await getStoredConfig(['authToken', 'apiUrl']);
@@ -2002,7 +942,7 @@ function startQwenImageWorker() {
       }
     } catch (err) {
       handleExtensionContextError(err);
-      if (extensionContextInvalidated) {
+      if (isExtensionContextInvalidated()) {
         stopped = true;
         return;
       }
@@ -2015,7 +955,7 @@ function startQwenImageWorker() {
 
   void tick();
   const intervalId = window.setInterval(() => {
-    if (stopped || extensionContextInvalidated) {
+    if (stopped || isExtensionContextInvalidated()) {
       window.clearInterval(intervalId);
       return;
     }
@@ -2088,38 +1028,6 @@ async function runQwenImageJob(job: any, apiUrl: string, authToken: string) {
   showToast(`Qwen 图片已保存: ${fileName}`, 3500);
 }
 
-async function fetchQwenImageWithRetry(imageURL: string): Promise<{ bodyBase64: string; contentType: string; finalUrl: string }> {
-  const strategies = [
-    { name: 'omit', options: { credentials: 'omit', redirect: 'follow' } },
-    { name: 'include', options: { credentials: 'include', redirect: 'follow' } },
-    { name: 'default', options: { redirect: 'follow' } },
-  ] as const;
-  let lastError = 'unknown error';
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    if (attempt > 1) await sleep(1000 * attempt);
-    for (const strategy of strategies) {
-      const resp = await bgFetchBinary(imageURL, strategy.options);
-      if (resp.ok && resp.bodyBase64) {
-        debugLog('qwen 图片抓取策略成功', {
-          attempt,
-          strategy: strategy.name,
-          status: resp.status,
-          contentType: resp.contentType,
-          finalUrl: resp.finalUrl,
-        });
-        return {
-          bodyBase64: resp.bodyBase64,
-          contentType: resp.contentType || 'image/png',
-          finalUrl: resp.finalUrl || imageURL,
-        };
-      }
-      lastError = resp.error || `HTTP ${resp.status}`;
-      debugLog('qwen 图片抓取策略失败', { attempt, strategy: strategy.name, error: lastError });
-    }
-  }
-  throw new Error(`qwen image fetch failed: ${lastError}`);
-}
-
 function getBrowserTextWorkerSiteID(): string | null {
   const siteID = getSiteAdapter().id;
   return browserTextWorkerSites.has(siteID) ? siteID : null;
@@ -2133,7 +1041,7 @@ function startBrowserTextWorker(siteID: string) {
   debugLog('browser text worker 已启动', { siteID });
 
   const tick = async () => {
-    if (running || stopped || extensionContextInvalidated) return;
+    if (running || stopped || isExtensionContextInvalidated()) return;
     running = true;
     try {
       const { authToken, apiUrl } = await getStoredConfig(['authToken', 'apiUrl']);
@@ -2184,7 +1092,7 @@ function startBrowserTextWorker(siteID: string) {
       }
     } catch (err) {
       handleExtensionContextError(err);
-      if (extensionContextInvalidated) {
+      if (isExtensionContextInvalidated()) {
         stopped = true;
         return;
       }
@@ -2197,7 +1105,7 @@ function startBrowserTextWorker(siteID: string) {
 
   void tick();
   const intervalId = window.setInterval(() => {
-    if (stopped || extensionContextInvalidated) {
+    if (stopped || isExtensionContextInvalidated()) {
       window.clearInterval(intervalId);
       return;
     }
@@ -2276,147 +1184,6 @@ async function runBrowserTextJob(job: any, apiUrl: string, authToken: string) {
   showToast(`文本任务已完成: ${job.id}`, 2500);
 }
 
-async function waitForCurrentEditor(selector: string, timeoutMs: number): Promise<HTMLElement> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const editor = getCurrentEditor(selector);
-    if (editor) return editor;
-    await sleep(250);
-  }
-  throw new Error(`editor not found: ${selector}`);
-}
-
-async function setBrowserTextPrompt(editor: HTMLElement, text: string): Promise<void> {
-  const adapter = getSiteAdapter();
-  if (adapter.id === 'gemini') {
-    await setGeminiPrompt(editor, text);
-    return;
-  }
-  if (adapter.id === 'chatgpt') {
-    await setChatGPTPrompt(editor, text);
-    return;
-  }
-  if (adapter.id === 'kimi') {
-    await setKimiPrompt(editor, text);
-    return;
-  }
-  if (adapter.id === 'qwen' && editor instanceof HTMLTextAreaElement) {
-    setQwenPrompt(editor, text);
-    await sleep(250);
-    return;
-  }
-  if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
-    applyTextareaValue(editor as HTMLTextAreaElement, text);
-    await sleep(250);
-    return;
-  }
-  editor.focus();
-  try {
-    const selection = window.getSelection();
-    if (selection) {
-      const range = document.createRange();
-      range.selectNodeContents(editor);
-      selection.removeAllRanges();
-      selection.addRange(range);
-    }
-    document.execCommand('delete', false);
-    document.execCommand('insertText', false, text);
-  } catch {}
-  editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-  editor.dispatchEvent(new Event('change', { bubbles: true }));
-  await sleep(250);
-  if (normalizeEditorPlainText(getEditorText(editor)) !== normalizeEditorPlainText(text)) {
-    setContentEditablePlainText(editor, text);
-    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-    editor.dispatchEvent(new Event('change', { bubbles: true }));
-    await sleep(250);
-  }
-}
-
-async function setKimiPrompt(editor: HTMLElement, text: string): Promise<void> {
-  if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
-    applyTextareaValue(editor as HTMLTextAreaElement, text);
-    await sleep(250);
-    return;
-  }
-
-  insertContentEditableText(editor, text);
-  await sleep(250);
-  if (normalizeEditorPlainText(getEditorText(editor)) !== normalizeEditorPlainText(text)) {
-    insertContentEditableText(editor, text);
-    await sleep(250);
-  }
-  const actual = normalizeEditorPlainText(getEditorText(editor));
-  const expected = normalizeEditorPlainText(text);
-  if (actual !== expected) {
-    throw new Error(`kimi prompt write mismatch: expected_len=${expected.length} actual_len=${actual.length} actual_preview=${actual.slice(0, 120)}`);
-  }
-}
-
-function insertContentEditableText(editor: HTMLElement, text: string): void {
-  editor.focus();
-  try {
-    const selection = window.getSelection();
-    if (selection) {
-      const range = document.createRange();
-      range.selectNodeContents(editor);
-      selection.removeAllRanges();
-      selection.addRange(range);
-    }
-    document.execCommand('delete', false);
-    document.execCommand('insertText', false, text);
-  } catch {
-    setContentEditablePlainText(editor, text);
-    editor.dispatchEvent(new Event('input', { bubbles: true }));
-  }
-  editor.dispatchEvent(new Event('change', { bubbles: true }));
-}
-
-function normalizeEditorPlainText(text: string): string {
-  return text.replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n').trim();
-}
-
-function setContentEditablePlainText(editor: HTMLElement, text: string): void {
-  editor.focus();
-  try {
-    const selection = window.getSelection();
-    if (selection) {
-      const range = document.createRange();
-      range.selectNodeContents(editor);
-      selection.removeAllRanges();
-      selection.addRange(range);
-    }
-    document.execCommand('delete', false);
-  } catch {}
-  editor.textContent = text;
-}
-
-async function waitForBrowserTextSendButton(editor: HTMLElement, timeoutMs: number): Promise<HTMLElement | null> {
-  const adapter = getSiteAdapter();
-  if (adapter.id === 'chatgpt') return waitForChatGPTSendButton(editor, timeoutMs);
-  if (adapter.id === 'qwen') return waitForQwenSendButton(editor, timeoutMs);
-  const deadline = Date.now() + timeoutMs;
-  let lastState = '';
-  while (Date.now() < deadline) {
-    const sendBtn = getSendButtonForEditor(editor, adapter.config.sendBtn);
-    if (sendBtn && isVisibleElement(sendBtn) && !(sendBtn as HTMLButtonElement).disabled && sendBtn.getAttribute('aria-disabled') !== 'true') {
-      return sendBtn;
-    }
-    const state = sendBtn ? {
-      disabled: (sendBtn as HTMLButtonElement).disabled,
-      ariaDisabled: sendBtn.getAttribute('aria-disabled') || '',
-      text: (sendBtn.textContent || '').trim().slice(0, 40),
-    } : { missing: true };
-    const summary = JSON.stringify(state);
-    if (summary !== lastState) {
-      lastState = summary;
-      debugLog('text job 等待发送按钮', { siteID: adapter.id, ...state });
-    }
-    await sleep(250);
-  }
-  return null;
-}
-
 function getBrowserTextResponseCandidates(): HTMLElement[] {
   const adapter = getSiteAdapter();
   const selector = adapter.config.responseSelector;
@@ -2427,278 +1194,6 @@ function getBrowserTextResponseCandidates(): HTMLElement[] {
       if (adapter.id === 'deepseek' && el.closest('.ds-think-content')) return false;
       return true;
     });
-}
-
-function getDeepSeekMessageRoot(el: Element | null): Element | null {
-  return el?.closest('[data-virtual-list-item-key]') ?? null;
-}
-
-function getDeepSeekLatestResponseState(target?: HTMLElement | null): Record<string, unknown> {
-  const message = getDeepSeekMessageRoot(target ?? null)
-    ?? Array.from(document.querySelectorAll<HTMLElement>('[data-virtual-list-item-key]'))
-      .filter((el) => !!el.querySelector('.ds-message .ds-markdown'))
-      .at(-1)
-    ?? null;
-  if (!message) return { found: false };
-  const markdowns = Array.from(message.querySelectorAll<HTMLElement>('.ds-markdown'));
-  const thinkMarkdowns = markdowns.filter((el) => !!el.closest('.ds-think-content'));
-  const answerMarkdowns = markdowns.filter((el) => !el.closest('.ds-think-content'));
-  const buttons = Array.from(message.querySelectorAll<HTMLElement>('button, [role="button"]')).filter((el) => isVisibleElement(el));
-  const childClasses = Array.from(message.children).map((child) => ({
-    tag: child.tagName.toLowerCase(),
-    className: child.className || '',
-    text: (child.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
-  }));
-  const latestAnswer = answerMarkdowns.at(-1) ?? null;
-  const latestThink = thinkMarkdowns.at(-1) ?? null;
-  const afterAnswerButtonCount = latestAnswer
-    ? buttons.filter((button) => !!(latestAnswer.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING)).length
-    : 0;
-  return {
-    found: true,
-    key: message.getAttribute('data-virtual-list-item-key') || '',
-    markdownCount: markdowns.length,
-    thinkMarkdownCount: thinkMarkdowns.length,
-    answerMarkdownCount: answerMarkdowns.length,
-    thinkContentCount: message.querySelectorAll('.ds-think-content').length,
-    actionButtonCount: buttons.length,
-    afterAnswerButtonCount,
-    childClasses,
-    latestThinkLength: latestThink ? getBrowserTextResponseText(latestThink).length : 0,
-    latestAnswerLength: latestAnswer ? getBrowserTextResponseText(latestAnswer).length : 0,
-    latestAnswerPreview: latestAnswer ? getBrowserTextResponseText(latestAnswer).slice(0, 160) : '',
-  };
-}
-
-function getBrowserTextResponseDebugSummary(candidates: HTMLElement[], pollCount: number): Record<string, unknown> {
-  const adapter = getSiteAdapter();
-  const summary: Record<string, unknown> = {
-    pollCount,
-    candidateCount: candidates.length,
-    latestKeys: candidates.slice(-3).map((el) => getBrowserTextResponseNodeKey(el)),
-  };
-  if (adapter.id === 'deepseek') {
-    summary.deepseek = getDeepSeekLatestResponseState(candidates.at(-1) ?? null);
-  }
-  if (adapter.id === 'kimi') {
-    summary.kimi = getKimiLatestResponseState(candidates.at(-1) ?? null);
-  }
-  return summary;
-}
-
-function isDeepSeekResponseComplete(el: HTMLElement): boolean {
-  const state = getDeepSeekLatestResponseState(el);
-  return state.found === true && Number(state.answerMarkdownCount || 0) > 0 && Number(state.afterAnswerButtonCount || 0) > 0;
-}
-
-function getKimiMessageRoot(el: Element | null): Element | null {
-  return el?.closest('.segment-assistant, .chat-content-item-assistant') ?? null;
-}
-
-function getKimiLatestResponseState(target?: HTMLElement | null): Record<string, unknown> {
-  const message = getKimiMessageRoot(target ?? null)
-    ?? Array.from(document.querySelectorAll<HTMLElement>('.segment-assistant, .chat-content-item-assistant'))
-      .filter((el) => !!el.querySelector('.markdown, .markdown-container'))
-      .at(-1)
-    ?? null;
-  if (!message) return { found: false };
-  const markdown = message.querySelector<HTMLElement>('.markdown, .markdown-container');
-  const actions = Array.from(message.querySelectorAll<HTMLElement>('.segment-assistant-actions, .segment-assistant-actions-content'))
-    .filter((el) => isVisibleElement(el));
-  const afterAnswerActionCount = markdown
-    ? actions.filter((action) => !!(markdown.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING)).length
-    : 0;
-  return {
-    found: true,
-    rootClassName: message.className || '',
-    markdownCount: message.querySelectorAll('.markdown, .markdown-container').length,
-    actionCount: actions.length,
-    afterAnswerActionCount,
-    textLength: markdown ? getBrowserTextResponseText(markdown).length : 0,
-    textPreview: markdown ? getBrowserTextResponseText(markdown).slice(0, 160) : '',
-  };
-}
-
-function isKimiResponseComplete(el: HTMLElement): boolean {
-  const state = getKimiLatestResponseState(el);
-  return state.found === true && Number(state.markdownCount || 0) > 0 && Number(state.afterAnswerActionCount || 0) > 0;
-}
-
-function getBrowserTextResponseNodeKey(el: HTMLElement): string {
-  const stable = el.closest('[data-message-id], [data-virtual-list-item-key], [data-testid="receive_message"], .chat-response-message, .segment-assistant, .chat-content-item-assistant, model-response, [data-message-author-role="assistant"]');
-  const id = stable?.getAttribute('data-message-id')
-    || stable?.getAttribute('data-virtual-list-item-key')
-    || stable?.getAttribute('id')
-    || '';
-  return id ? `${stable?.tagName.toLowerCase()}:${id}` : getElementPathKey(stable ?? el, 10);
-}
-
-function getBrowserTextResponseText(el: HTMLElement): string {
-  if (getSiteAdapter().id === 'deepseek') return getDeepSeekMarkdownText(el);
-  if (getSiteAdapter().id === 'kimi') return getKimiMarkdownText(el);
-  const clone = el.cloneNode(true) as HTMLElement;
-  clone.querySelectorAll('button, [role="button"], nav, [data-testid*="action"], [data-testid="message_action_bar"], .message-hoc-container').forEach((node) => node.remove());
-  return (clone.innerText || clone.textContent || '').replace(/\u00a0/g, ' ').trim();
-}
-
-function getDeepSeekMarkdownText(el: HTMLElement): string {
-  const clone = el.cloneNode(true) as HTMLElement;
-  clone.querySelectorAll('button, [role="button"], nav, svg, style, script, .message-hoc-container, .f93f59e4, .ds-markdown-cite, ._2ed5dee').forEach((node) => node.remove());
-  return normalizeMarkdownBlocks(renderMarkdownBlocks(clone).join('\n\n'));
-}
-
-function getKimiMarkdownText(el: HTMLElement): string {
-  const clone = el.cloneNode(true) as HTMLElement;
-  clone.querySelectorAll('button, [role="button"], nav, svg, style, script, .segment-assistant-actions, .segment-user-actions, .table-actions, .icon-button').forEach((node) => node.remove());
-  return normalizeMarkdownBlocks(renderMarkdownBlocks(clone).join('\n\n'));
-}
-
-function normalizeMarkdownBlocks(text: string): string {
-  return text
-    .replace(/\u00a0/g, ' ')
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function renderMarkdownBlocks(root: Element): string[] {
-  const blocks: string[] = [];
-  for (const child of Array.from(root.childNodes)) {
-    blocks.push(...renderMarkdownNode(child, 0));
-  }
-  return blocks.map((block) => block.trim()).filter(Boolean);
-}
-
-function renderMarkdownNode(node: Node, depth: number): string[] {
-  if (node.nodeType === Node.TEXT_NODE) {
-    const text = normalizeInlineWhitespace(node.textContent || '');
-    return text ? [text] : [];
-  }
-  if (node.nodeType !== Node.ELEMENT_NODE) return [];
-  const el = node as HTMLElement;
-  const tag = el.tagName.toLowerCase();
-
-  if (tag === 'br') return ['\n'];
-  if (tag === 'p') return [renderMarkdownInlineChildren(el).trim()].filter(Boolean);
-  if (tag === 'div' && el.classList.contains('paragraph')) return [renderMarkdownInlineChildren(el).trim()].filter(Boolean);
-  if (tag === 'div' && el.classList.contains('table-container')) return renderMarkdownBlocks(el);
-  if (tag === 'div' && el.classList.contains('markdown-table')) {
-    const table = el.querySelector('table');
-    return table ? [renderMarkdownTable(table)].filter(Boolean) : renderMarkdownBlocks(el);
-  }
-  if (/^h[1-6]$/.test(tag)) {
-    const level = Number(tag.slice(1));
-    const text = renderMarkdownInlineChildren(el).trim();
-    return text ? [`${'#'.repeat(level)} ${text}`] : [];
-  }
-  if (tag === 'ul' || tag === 'ol') return renderMarkdownList(el, depth, tag === 'ol');
-  if (tag === 'pre') return [renderMarkdownPre(el)];
-  if (tag === 'blockquote') {
-    return renderMarkdownBlocks(el).map((block) => block.split('\n').map((line) => `> ${line}`).join('\n'));
-  }
-  if (tag === 'table') return [renderMarkdownTable(el)].filter(Boolean);
-  if (tag === 'div' || tag === 'section' || tag === 'article') return renderMarkdownBlocks(el);
-
-  const inline = renderMarkdownInline(el).trim();
-  return inline ? [inline] : [];
-}
-
-function renderMarkdownList(listEl: Element, depth: number, ordered: boolean): string[] {
-  const lines: string[] = [];
-  let index = 1;
-  for (const li of Array.from(listEl.children).filter((child) => child.tagName.toLowerCase() === 'li')) {
-    const marker = ordered ? `${index}.` : '-';
-    const itemLines = renderMarkdownListItem(li as HTMLElement, depth);
-    if (itemLines.length === 0) continue;
-    const indent = '  '.repeat(depth);
-    lines.push(`${indent}${marker} ${itemLines[0]}`);
-    for (const extra of itemLines.slice(1)) {
-      lines.push(extra ? `${indent}  ${extra}` : '');
-    }
-    index += 1;
-  }
-  return lines.length ? [lines.join('\n')] : [];
-}
-
-function renderMarkdownListItem(li: HTMLElement, depth: number): string[] {
-  const lines: string[] = [];
-  let inlineParts: string[] = [];
-  const flushInline = () => {
-    const text = inlineParts.join('').trim();
-    if (text) lines.push(text);
-    inlineParts = [];
-  };
-
-  for (const child of Array.from(li.childNodes)) {
-    if (child.nodeType === Node.ELEMENT_NODE) {
-      const tag = (child as Element).tagName.toLowerCase();
-      if (tag === 'ul' || tag === 'ol') {
-        flushInline();
-        lines.push(...renderMarkdownList(child as Element, depth + 1, tag === 'ol').join('\n').split('\n'));
-        continue;
-      }
-      if (tag === 'p') {
-        flushInline();
-        const text = renderMarkdownInlineChildren(child as HTMLElement).trim();
-        if (text) lines.push(text);
-        continue;
-      }
-    }
-    inlineParts.push(renderMarkdownInline(child));
-  }
-  flushInline();
-  return lines;
-}
-
-function renderMarkdownPre(pre: Element): string {
-  const code = pre.querySelector('code');
-  const languageClass = code?.className.match(/language-([\w-]+)/)?.[1] || '';
-  const text = (code?.textContent || pre.textContent || '').replace(/\n+$/, '');
-  return `\`\`\`${languageClass}\n${text}\n\`\`\``;
-}
-
-function renderMarkdownTable(table: Element): string {
-  const rows = Array.from(table.querySelectorAll('tr')).map((tr) => Array.from(tr.children).map((cell) => renderMarkdownInlineChildren(cell as HTMLElement).trim()));
-  if (rows.length === 0) return '';
-  const header = rows[0];
-  const separator = header.map(() => '---');
-  const body = rows.slice(1);
-  return [header, separator, ...body].map((row) => `| ${row.join(' | ')} |`).join('\n');
-}
-
-function renderMarkdownInlineChildren(el: Element): string {
-  return Array.from(el.childNodes).map((child) => renderMarkdownInline(child)).join('').replace(/[ \t]+/g, ' ').trim();
-}
-
-function renderMarkdownInline(node: Node): string {
-  if (node.nodeType === Node.TEXT_NODE) return normalizeInlineWhitespace(node.textContent || '');
-  if (node.nodeType !== Node.ELEMENT_NODE) return '';
-  const el = node as HTMLElement;
-  const tag = el.tagName.toLowerCase();
-  if (tag === 'br') return '\n';
-  if (el.getAttribute('aria-hidden') === 'true') return '';
-  if (tag === 'svg' || tag === 'style' || tag === 'script') return '';
-  if (el.classList.contains('ds-markdown-cite') || el.classList.contains('_2ed5dee')) return '';
-
-  const text = renderMarkdownInlineChildren(el);
-  if (!text) return '';
-  if (tag === 'strong' || tag === 'b') return `**${text}**`;
-  if (tag === 'em' || tag === 'i') return `*${text}*`;
-  if (tag === 'code') return `\`${text.replace(/`/g, '\\`')}\``;
-  if (tag === 'a') return text;
-  return text;
-}
-
-function normalizeInlineWhitespace(text: string): string {
-  return text.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ');
-}
-
-function isLikelyBrowserTextOutput(text: string, prompt: string): boolean {
-  const normalized = text.replace(/\s+/g, ' ').trim();
-  if (!normalized) return false;
-  const normalizedPrompt = prompt.replace(/\s+/g, ' ').trim();
-  if (normalizedPrompt && normalized === normalizedPrompt) return false;
-  return true;
 }
 
 async function waitForBrowserTextResponse(beforeKeys: Set<string>, prompt: string, timeoutMs: number, reportChunk?: BrowserTextChunkReporter): Promise<{ key: string; text: string }> {
@@ -2713,7 +1208,7 @@ async function waitForBrowserTextResponse(beforeKeys: Set<string>, prompt: strin
     const candidates = getBrowserTextResponseCandidates();
     const summaryObject = getBrowserTextResponseDebugSummary(candidates, pollCount);
     const summary = JSON.stringify(summaryObject);
-    if (summary !== lastSummary && (adapter.id === 'deepseek' || adapter.id === 'kimi' || pollCount <= 5 || pollCount % 10 === 0)) {
+    if (summary !== lastSummary && (adapter.id === 'deepseek' || adapter.id === 'kimi' || adapter.id === 'qwen' || pollCount <= 5 || pollCount % 10 === 0)) {
       lastSummary = summary;
       debugLog('text job 响应轮询状态', JSON.parse(summary));
     }
@@ -2726,6 +1221,7 @@ async function waitForBrowserTextResponse(beforeKeys: Set<string>, prompt: strin
         candidateKey = key;
         if (adapter.id === 'deepseek') debugLog('deepseek 候选响应结构', getDeepSeekLatestResponseState(el));
         if (adapter.id === 'kimi') debugLog('kimi 候选响应结构', getKimiLatestResponseState(el));
+        if (adapter.id === 'qwen') debugLog('qwen 候选响应结构', getQwenLatestResponseState(el));
         debugLog('text job 捕获到候选响应', { key, length: text.length, preview: text.slice(0, 160) });
         break;
       }
@@ -2763,6 +1259,7 @@ async function waitForBrowserTextStability(el: HTMLElement, prompt: string, quie
       lastLoggedText = text;
       if (adapter.id === 'deepseek') debugLog('deepseek 响应结构更新', getDeepSeekLatestResponseState(el));
       if (adapter.id === 'kimi') debugLog('kimi 响应结构更新', getKimiLatestResponseState(el));
+      if (adapter.id === 'qwen') debugLog('qwen 响应结构更新', getQwenLatestResponseState(el));
       debugLog('text job 响应内容更新', { length: text.length, preview: text.slice(0, 160) });
     }
     if (isLikelyBrowserTextOutput(text, prompt) && text === lastText) {
@@ -2785,6 +1282,12 @@ async function waitForBrowserTextStability(el: HTMLElement, prompt: string, quie
           await sleep(500);
           continue;
         }
+        if (adapter.id === 'qwen' && !isBrowserTextQwenResponseComplete(el)) {
+          debugLog('qwen 响应文本已稳定但停止按钮仍存在，继续等待', getQwenLatestResponseState(el));
+          stableSince = 0;
+          await sleep(500);
+          continue;
+        }
         debugLog('text job 响应已稳定', { quietMs, length: text.length, preview: text.slice(0, 160) });
         return text;
       }
@@ -2797,484 +1300,6 @@ async function waitForBrowserTextStability(el: HTMLElement, prompt: string, quie
   if (isLikelyBrowserTextOutput(lastText, prompt)) return lastText;
   debugLog('text job 响应未稳定', { timeoutMs, lastLength: lastText.length, preview: lastText.slice(0, 160) });
   throw new Error('browser text response did not stabilize');
-}
-
-async function clearQwenComposerAttachments(editor: HTMLElement): Promise<void> {
-  for (let pass = 0; pass < 5; pass++) {
-    const buttons = getQwenComposerRemoveButtons(editor);
-    if (buttons.length === 0) return;
-    debugLog('qwen 清理参考图', { pass: pass + 1, count: buttons.length });
-    for (const btn of buttons) {
-      await clickElementLikeUser(btn);
-      await sleep(200);
-    }
-    await sleep(500);
-  }
-}
-
-function getQwenComposerRegion(editor: HTMLElement): Element {
-  return editor.closest('.message-input-container') ?? editor.closest('.chat-prompt') ?? editor.parentElement ?? document.body;
-}
-
-function getQwenComposerRemoveButtons(editor: HTMLElement): HTMLElement[] {
-  const region = getQwenComposerRegion(editor);
-  return Array.from(region.querySelectorAll<HTMLElement>('.vision-item-container .close-button, .fileitem-btn .close-button, button.close-button, .close-button'))
-    .filter((btn) => isVisibleElement(btn));
-}
-
-function getQwenComposerAttachmentCount(editor: HTMLElement): number {
-  const region = getQwenComposerRegion(editor);
-  const images = Array.from(region.querySelectorAll<HTMLImageElement>('img.vision-item-image')).filter((img) => {
-    if (!isVisibleElement(img)) return false;
-    const src = img.currentSrc || img.getAttribute('src') || '';
-    return !!src;
-  });
-  return new Set(images.map((img) => img.currentSrc || img.getAttribute('src') || getElementPathKey(img))).size;
-}
-
-async function attachQwenReferenceImages(editor: HTMLElement, items: any[], apiUrl: string, authToken: string): Promise<void> {
-  const files = await Promise.all(items.map((item, index) => referenceImageJobToFile(item, index, apiUrl, authToken)));
-  const beforeCount = getQwenComposerAttachmentCount(editor);
-  debugLog('qwen 开始附加参考图', {
-    count: files.length,
-    beforeCount,
-    files: files.map((file) => ({ name: file.name, size: file.size, type: file.type })),
-  });
-
-  await openQwenUploadMenu();
-  const input = await waitForElement<HTMLInputElement>('input#filesUpload[type="file"], input[type="file"]', 10000);
-  setFileInputFiles(input, files);
-  debugLog('qwen 已触发文件输入 change', { count: files.length });
-
-  const expectedCount = beforeCount + files.length;
-  const ready = await waitForQwenAttachmentReady(editor, expectedCount, 90000);
-  debugLog('qwen 参考图附加完成', { expectedCount, ready, count: getQwenComposerAttachmentCount(editor) });
-  if (!ready) throw new Error('qwen reference image did not stabilize before prompt');
-}
-
-async function openQwenUploadMenu(): Promise<void> {
-  const isMenuItemVisible = (el: HTMLElement): boolean => {
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
-  };
-  const findUploadItem = () => Array.from(document.querySelectorAll<HTMLElement>('[role="menuitem"], li.mode-select-common-item, .mode-select-dropdown-item'))
-    .find((el) => /上传附件/.test(el.textContent || '') && isMenuItemVisible(el));
-
-  let uploadItem = findUploadItem();
-  if (uploadItem) {
-    await clickElementLikeUser(uploadItem);
-    await sleep(300);
-    return;
-  }
-
-  const trigger = document.querySelector<HTMLElement>('.mode-select .ant-dropdown-trigger, .mode-select-open');
-  if (!trigger) throw new Error('qwen upload menu trigger not found');
-  await clickElementLikeUser(trigger);
-  await sleep(300);
-  uploadItem = findUploadItem();
-  if (!uploadItem) throw new Error('qwen upload menu item not found');
-  await clickElementLikeUser(uploadItem);
-  await sleep(300);
-}
-
-async function waitForQwenAttachmentReady(editor: HTMLElement, expectedCount: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  let lastCount = -1;
-  let readySince = 0;
-  while (Date.now() < deadline) {
-    const count = getQwenComposerAttachmentCount(editor);
-    if (count !== lastCount) {
-      lastCount = count;
-      readySince = 0;
-      debugLog('qwen 等待参考图稳定', { expectedCount, count, timeoutMs });
-    }
-    if (count >= expectedCount) {
-      if (!readySince) readySince = Date.now();
-      if (Date.now() - readySince >= 2500) return true;
-    } else {
-      readySince = 0;
-    }
-    await sleep(500);
-  }
-  return false;
-}
-
-function setQwenPrompt(editor: HTMLTextAreaElement, text: string): void {
-  editor.focus();
-  applyTextareaValue(editor, text);
-}
-
-async function waitForQwenSendButton(editor: HTMLElement, timeoutMs: number): Promise<HTMLElement | null> {
-  const deadline = Date.now() + timeoutMs;
-  let lastState = '';
-  while (Date.now() < deadline) {
-    const sendBtn = getSendButtonForEditor(editor, getSiteConfig().sendBtn)
-      ?? document.querySelector<HTMLElement>('.message-input-right-button-send button.send-button, button.send-button');
-    if (sendBtn && isVisibleElement(sendBtn) && !(sendBtn as HTMLButtonElement).disabled) return sendBtn;
-
-    const state = sendBtn ? {
-      disabled: (sendBtn as HTMLButtonElement).disabled,
-      className: sendBtn.className,
-      text: (sendBtn.textContent || '').trim().slice(0, 40),
-    } : { missing: true };
-    const summary = JSON.stringify(state);
-    if (summary !== lastState) {
-      lastState = summary;
-      debugLog('qwen 等待发送按钮', state);
-    }
-    await sleep(250);
-  }
-  return null;
-}
-
-function getQwenGeneratedImageElements(): HTMLImageElement[] {
-  return Array.from(document.querySelectorAll<HTMLImageElement>('.chat-response-message img.qwen-image, .chat-response-message img[src*="/image_gen/"], .chat-response-message img[src*="/image_edit/"]'))
-    .filter((img) => {
-      if (!isVisibleElement(img)) return false;
-      const src = img.currentSrc || img.getAttribute('src') || '';
-      if (!src) return false;
-      if (src.includes('.apng') || img.getAttribute('alt') === '加载中...') return false;
-      if (!src.includes('/image_gen/') && !src.includes('/image_edit/') && !img.classList.contains('qwen-image')) return false;
-      const rect = img.getBoundingClientRect();
-      return img.naturalWidth >= 128 || rect.width >= 120;
-    });
-}
-
-function getQwenImageKeys(): string[] {
-  return Array.from(new Set(getQwenGeneratedImageElements()
-    .map((img) => img.currentSrc || img.getAttribute('src') || '')
-    .filter(Boolean)));
-}
-
-async function waitForNewQwenImage(previousKeysInput: string[] | Set<string>, timeoutMs: number): Promise<HTMLImageElement> {
-  const deadline = Date.now() + timeoutMs;
-  const previousKeys = previousKeysInput instanceof Set ? previousKeysInput : new Set(previousKeysInput);
-  debugLog('qwen 等待新图片', { previousKeys: Array.from(previousKeys), timeoutMs });
-  let lastSeenKeys = '';
-  while (Date.now() < deadline) {
-    const currentKeys = getQwenImageKeys();
-    const currentKeySummary = currentKeys.join(',');
-    if (currentKeySummary !== lastSeenKeys) {
-      lastSeenKeys = currentKeySummary;
-      debugLog('qwen 当前图片 key', currentKeys);
-    }
-    const images = getQwenGeneratedImageElements();
-    for (let i = images.length - 1; i >= 0; i--) {
-      const img = images[i];
-      const key = img.currentSrc || img.getAttribute('src') || '';
-      if (!key || previousKeys.has(key)) continue;
-      if (img.complete && (img.naturalWidth > 0 || img.getBoundingClientRect().width >= 120)) {
-        debugLog('qwen 新图片已就绪', { key, width: img.naturalWidth, height: img.naturalHeight, alt: img.getAttribute('alt') || '' });
-        return img;
-      }
-    }
-    await sleep(1000);
-  }
-  debugLog('qwen 等待新图片超时', { previousKeys: Array.from(previousKeys), timeoutMs, currentKeys: getQwenImageKeys() });
-  throw new Error('wait for qwen generated image timed out');
-}
-
-async function clearChatGPTComposerAttachments(editor: HTMLElement): Promise<void> {
-  for (let pass = 0; pass < 5; pass++) {
-    const buttons = getChatGPTComposerRemoveButtons(editor);
-    if (buttons.length === 0) return;
-    debugLog('chatgpt 清理参考图', { pass: pass + 1, count: buttons.length });
-    for (const btn of buttons) {
-      await clickElementLikeUser(btn);
-      await sleep(150);
-    }
-    await sleep(500);
-  }
-  const remaining = getChatGPTComposerAttachmentCount(editor);
-  if (remaining > 0) debugLog('chatgpt 参考图未完全清理', { remaining });
-}
-
-async function setChatGPTPrompt(editor: HTMLElement, text: string) {
-  editor.focus();
-  const selection = window.getSelection();
-  if (selection) {
-    const range = document.createRange();
-    range.selectNodeContents(editor);
-    selection.removeAllRanges();
-    selection.addRange(range);
-  }
-  try { document.execCommand('delete', false); } catch {}
-  await sleep(80);
-  editor.focus();
-  try { document.execCommand('insertText', false, text); } catch {}
-  editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-  editor.dispatchEvent(new Event('change', { bubbles: true }));
-  await sleep(200);
-  if (!getEditorText(editor).includes(text.trim())) {
-    editor.textContent = text;
-    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-    editor.dispatchEvent(new Event('change', { bubbles: true }));
-  }
-}
-
-async function waitForChatGPTSendButton(editor: HTMLElement, timeoutMs: number): Promise<HTMLElement | null> {
-  const deadline = Date.now() + timeoutMs;
-  let lastState = '';
-  while (Date.now() < deadline) {
-    const sendBtn = getSendButtonForEditor(editor, getSiteConfig().sendBtn)
-      ?? getChatGPTComposerRegion(editor).querySelector<HTMLElement>('button#composer-submit-button, button[data-testid="send-button"], button[aria-label="发送提示"], button[aria-label*="Send"]');
-    if (sendBtn && isVisibleElement(sendBtn) && !(sendBtn as HTMLButtonElement).disabled) return sendBtn;
-
-    const state = getChatGPTComposerButtonState(editor);
-    const summary = JSON.stringify(state);
-    if (summary !== lastState) {
-      lastState = summary;
-      debugLog('chatgpt 等待发送按钮', state);
-    }
-    await sleep(250);
-  }
-  debugLog('chatgpt 发送按钮等待超时', getChatGPTComposerButtonState(editor));
-  return null;
-}
-
-async function attachChatGPTReferenceImages(editor: HTMLElement, items: any[], apiUrl: string, authToken: string): Promise<void> {
-  const files = await Promise.all(items.map((item, index) => referenceImageJobToFile(item, index, apiUrl, authToken)));
-  const beforeCount = getChatGPTComposerAttachmentCount(editor);
-  debugLog('chatgpt 开始附加参考图', {
-    count: files.length,
-    beforeCount,
-    files: files.map((file) => ({ name: file.name, size: file.size, type: file.type })),
-  });
-
-  const input = document.querySelector<HTMLInputElement>('input#upload-photos[type="file"], input#upload-files[type="file"], input[type="file"][accept*="image"]');
-  if (!input) throw new Error('chatgpt file input not found');
-  setFileInputFiles(input, files);
-  debugLog('chatgpt 已触发文件输入 change', { count: files.length });
-
-  const expectedCount = beforeCount + files.length;
-  const ready = await waitForChatGPTAttachmentReady(editor, expectedCount, 90000);
-  debugLog('chatgpt 参考图附加完成', { expectedCount, ready, count: getChatGPTComposerAttachmentCount(editor) });
-  if (!ready) throw new Error('chatgpt reference image did not stabilize before prompt');
-}
-
-function getChatGPTComposerRegion(editor: HTMLElement): Element {
-  return editor.closest('form') ?? editor.closest('[data-testid*="composer"]') ?? editor.parentElement ?? document.body;
-}
-
-function getChatGPTComposerRemoveButtons(editor: HTMLElement): HTMLElement[] {
-  const region = getChatGPTComposerRegion(editor);
-  return Array.from(region.querySelectorAll<HTMLElement>('button[aria-label^="移除文件"], button[aria-label^="Remove file"], button[aria-label*="移除文件"], button[aria-label*="Remove file"]'))
-    .filter((btn) => isVisibleElement(btn));
-}
-
-function getChatGPTComposerAttachmentCount(editor: HTMLElement): number {
-  const region = getChatGPTComposerRegion(editor);
-  const removeButtons = getChatGPTComposerRemoveButtons(editor);
-  if (removeButtons.length > 0) return removeButtons.length;
-  const images = Array.from(region.querySelectorAll<HTMLImageElement>('img')).filter((img) => {
-    const src = img.currentSrc || img.getAttribute('src') || '';
-    if (!src || !src.includes('/backend-api/estuary/content')) return false;
-    if (!isVisibleElement(img)) return false;
-    const rect = img.getBoundingClientRect();
-    return rect.width > 16 && rect.height > 16;
-  });
-  return new Set(images.map((img) => img.currentSrc || img.getAttribute('src') || getElementPathKey(img))).size;
-}
-
-function getChatGPTComposerButtonState(editor: HTMLElement): Array<Record<string, unknown>> {
-  const region = getChatGPTComposerRegion(editor);
-  return Array.from(region.querySelectorAll<HTMLElement>('button'))
-    .filter((btn) => isVisibleElement(btn))
-    .map((btn) => ({
-      ariaLabel: btn.getAttribute('aria-label') || '',
-      testId: btn.getAttribute('data-testid') || '',
-      id: btn.id || '',
-      disabled: (btn as HTMLButtonElement).disabled,
-      text: (btn.textContent || '').trim().slice(0, 40),
-    }))
-    .slice(-10);
-}
-
-async function waitForChatGPTAttachmentReady(editor: HTMLElement, expectedCount: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  let lastCount = -1;
-  let readySince = 0;
-  while (Date.now() < deadline) {
-    const count = getChatGPTComposerAttachmentCount(editor);
-    if (count !== lastCount) {
-      lastCount = count;
-      readySince = 0;
-      debugLog('chatgpt 等待参考图稳定', { expectedCount, count, timeoutMs });
-    }
-    if (count >= expectedCount) {
-      if (!readySince) readySince = Date.now();
-      if (Date.now() - readySince >= 2500) return true;
-    } else {
-      readySince = 0;
-    }
-    await sleep(500);
-  }
-  return false;
-}
-
-function getChatGPTGeneratedImageElements(): HTMLImageElement[] {
-  const images = Array.from(document.querySelectorAll<HTMLImageElement>('img[src*="/backend-api/estuary/content"], img[src*="chatgpt.com/backend-api/estuary/content"]'));
-  const generatedSrcs = new Set(images
-    .filter((img) => {
-      if (isChatGPTComposerImage(img) || isChatGPTUserUploadedImage(img)) return false;
-      const alt = (img.getAttribute('alt') || '').toLowerCase();
-      return alt.includes('已生成') || alt.includes('generated');
-    })
-    .map((img) => img.currentSrc || img.getAttribute('src') || '')
-    .filter(Boolean));
-  return images.filter((img) => {
-    if (isChatGPTComposerImage(img)) return false;
-    if (isChatGPTUserUploadedImage(img)) return false;
-    if (!isVisibleElement(img)) return false;
-    const src = img.currentSrc || img.getAttribute('src') || '';
-    if (!src) return false;
-    const alt = (img.getAttribute('alt') || '').toLowerCase();
-    if (alt.includes('已上传') || alt.includes('uploaded')) return false;
-    if (generatedSrcs.has(src)) return true;
-    const bigEnough = img.naturalWidth >= 256 || img.getBoundingClientRect().width >= 180;
-    return bigEnough && (alt.includes('已生成') || alt.includes('generated'));
-  });
-}
-
-function isChatGPTComposerImage(img: HTMLImageElement): boolean {
-  const composerForm = img.closest('form');
-  if (composerForm?.querySelector('#prompt-textarea')) return true;
-  const composerRegion = img.closest('[data-testid*="composer"], .group\\/composer');
-  return !!composerRegion;
-}
-
-function isChatGPTUserUploadedImage(img: HTMLImageElement): boolean {
-  const message = img.closest('[data-message-author-role]');
-  if (message?.getAttribute('data-message-author-role') === 'user') return true;
-  const alt = (img.getAttribute('alt') || '').toLowerCase();
-  return alt.includes('已上传') || alt.includes('uploaded');
-}
-
-function getChatGPTImageKeys(): string[] {
-  return Array.from(new Set(getChatGPTGeneratedImageElements()
-    .map((img) => img.currentSrc || img.getAttribute('src') || '')
-    .filter(Boolean)));
-}
-
-async function waitForNewChatGPTImage(previousKeysInput: string[] | Set<string>, timeoutMs: number): Promise<HTMLImageElement> {
-  const deadline = Date.now() + timeoutMs;
-  const previousKeys = previousKeysInput instanceof Set ? previousKeysInput : new Set(previousKeysInput);
-  debugLog('chatgpt 等待新图片', { previousKeys: Array.from(previousKeys), timeoutMs });
-  let lastSeenKeys = '';
-  while (Date.now() < deadline) {
-    const currentKeys = getChatGPTImageKeys();
-    const currentKeySummary = currentKeys.join(',');
-    if (currentKeySummary !== lastSeenKeys) {
-      lastSeenKeys = currentKeySummary;
-      debugLog('chatgpt 当前图片 key', currentKeys);
-    }
-    const images = getChatGPTGeneratedImageElements();
-    for (let i = images.length - 1; i >= 0; i--) {
-      const img = images[i];
-      const key = img.currentSrc || img.getAttribute('src') || '';
-      if (!key || previousKeys.has(key)) continue;
-      if (img.complete && (img.naturalWidth > 0 || img.getBoundingClientRect().width >= 180)) {
-        debugLog('chatgpt 新图片已就绪', { key, width: img.naturalWidth, height: img.naturalHeight, alt: img.getAttribute('alt') || '' });
-        return img;
-      }
-    }
-    await sleep(1000);
-  }
-  debugLog('chatgpt 等待新图片超时', { previousKeys: Array.from(previousKeys), timeoutMs, currentKeys: getChatGPTImageKeys() });
-  throw new Error('wait for chatgpt generated image timed out');
-}
-
-async function fetchGeminiOriginalImageWithRetry(originalURL: string): Promise<{ bodyBase64: string; contentType: string; finalUrl: string }> {
-  const maxAttempts = 3;
-  let lastError = 'unknown error';
-  const strategies = [
-    {
-      name: 'omit',
-      options: {
-        credentials: 'omit',
-        redirect: 'follow',
-        referrer: 'https://gemini.google.com/',
-        referrerPolicy: 'no-referrer-when-downgrade',
-      },
-    },
-    {
-      name: 'include',
-      options: {
-        credentials: 'include',
-        redirect: 'follow',
-        referrer: 'https://gemini.google.com/',
-        referrerPolicy: 'no-referrer-when-downgrade',
-      },
-    },
-  ] as const;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (attempt > 1) {
-      const delayMs = 1200 * attempt;
-      debugLog('gemini 无水印原图抓取重试等待', { attempt, delayMs, url: originalURL });
-      await sleep(delayMs);
-    }
-    for (const strategy of strategies) {
-      const mediaResp = await bgFetchBinary(originalURL, strategy.options);
-      if (mediaResp.ok && mediaResp.bodyBase64) {
-        debugLog('gemini 无水印原图抓取成功', {
-          attempt,
-          strategy: strategy.name,
-          status: mediaResp.status,
-          url: originalURL,
-          finalUrl: mediaResp.finalUrl,
-          contentType: mediaResp.contentType,
-        });
-        return mediaResp;
-      }
-      lastError = `HTTP ${mediaResp.status}${mediaResp.error ? ` ${mediaResp.error}` : ''}`;
-      debugLog('gemini 无水印原图抓取失败', {
-        attempt,
-        strategy: strategy.name,
-        url: originalURL,
-        error: lastError,
-      });
-    }
-  }
-  throw new Error(`gemini original image fetch failed after retry: ${lastError}`);
-}
-
-async function clickElementLikeUser(el: HTMLElement) {
-  el.focus();
-  const rect = el.getBoundingClientRect();
-  const clientX = rect.left + Math.max(1, Math.min(rect.width - 1, rect.width / 2 || 1));
-  const clientY = rect.top + Math.max(1, Math.min(rect.height - 1, rect.height / 2 || 1));
-  const mouseInit = { bubbles: true, cancelable: true, composed: true, clientX, clientY, button: 0 };
-
-  try { el.dispatchEvent(new PointerEvent('pointerdown', mouseInit)); } catch {}
-  el.dispatchEvent(new MouseEvent('mousedown', mouseInit));
-  await sleep(30);
-  try { el.dispatchEvent(new PointerEvent('pointerup', mouseInit)); } catch {}
-  el.dispatchEvent(new MouseEvent('mouseup', mouseInit));
-  el.dispatchEvent(new MouseEvent('click', mouseInit));
-  await sleep(80);
-
-  if (location.hostname === 'labs.google' && location.pathname.startsWith('/fx')) {
-    const stillThere = document.contains(el);
-    if (stillThere) {
-      el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-      el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-    }
-  }
-}
-
-function setContentEditableText(el: HTMLElement, text: string) {
-  el.focus();
-  const selection = window.getSelection();
-  if (selection) {
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    selection.removeAllRanges();
-    selection.addRange(range);
-  }
-  document.execCommand('insertText', false, text);
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 async function setLabsFxPrompt(editor: HTMLElement, text: string) {
@@ -3638,13 +1663,6 @@ function setFileInputFiles(input: HTMLInputElement, files: File[]) {
   input.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
-function base64ToBytes(base64: string): Uint8Array {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
 function buildReferenceImageJobURL(item: any, apiUrl?: string, authToken?: string): string {
   const direct = typeof item?.url === 'string' && item.url ? item.url
     : typeof item?.image_url === 'string' && item.image_url ? item.image_url
@@ -3715,7 +1733,7 @@ async function waitForLabsFxNewResourceTile(previousKeys: string[], timeoutMs: n
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     for (const tile of getLabsFxVisibleResourceTiles()) {
-      const key = tile.getAttribute('data-tile-id') || tile.querySelector('img[alt="生成的图片"]')?.getAttribute('src') || '';
+      const key = getLabsFxTileMediaKey(tile);
       if (key && !before.has(key)) return tile;
     }
     await sleep(250);
@@ -3868,853 +1886,6 @@ function placeCaretInLabsFxEditor(editor: HTMLElement) {
   selection.addRange(range);
 }
 
-function getLatestLabsFxImageKey(): string {
-  const tile = getLatestLabsFxTile();
-  if (!tile) return '';
-  return tile.getAttribute('data-tile-id') || tile.querySelector('img[alt="生成的图片"], video')?.getAttribute('src') || '';
-}
-
-function getLatestLabsFxImage(): HTMLImageElement | null {
-  return getLatestLabsFxTile()?.querySelector('img[alt="生成的图片"]') ?? null;
-}
-
-function getLatestLabsFxTile(): HTMLElement | null {
-  return getLabsFxVisibleResourceTiles()[0] ?? null;
-}
-
-function getLabsFxTileKeys(): string[] {
-  return getLabsFxVisibleResourceTiles()
-    .map((tile) => tile.getAttribute('data-tile-id') || tile.querySelector('img[alt="生成的图片"], video')?.getAttribute('src') || '')
-    .filter(Boolean);
-}
-
-function getLabsFxNewTile(previousKeys: Set<string>): { tile: HTMLElement; key: string; img: HTMLImageElement } | null {
-  for (const tile of getLabsFxVisibleResourceTiles()) {
-    const img = tile.querySelector('img[alt="生成的图片"]') as HTMLImageElement | null;
-    if (!img) continue;
-    const key = tile.getAttribute('data-tile-id') || img.getAttribute('src') || '';
-    if (!key || previousKeys.has(key)) continue;
-    return { tile, key, img };
-  }
-  return null;
-}
-
-function getLabsFxNewMediaTile(previousKeys: Set<string>, mediaKind: 'image' | 'video'): { tile: HTMLElement; key: string; media: HTMLImageElement | HTMLVideoElement } | null {
-  for (const tile of getLabsFxVisibleResourceTiles()) {
-    const media = mediaKind === 'video'
-      ? tile.querySelector('video')
-      : tile.querySelector('img[alt="生成的图片"]');
-    if (!media) continue;
-    const key = tile.getAttribute('data-tile-id') || media.getAttribute('src') || '';
-    if (!key || previousKeys.has(key)) continue;
-    return { tile, key, media: media as HTMLImageElement | HTMLVideoElement };
-  }
-  return null;
-}
-
-function getLabsFxUnexpectedNewMediaKind(previousKeys: Set<string>, expectedKind: 'image' | 'video'): 'image' | 'video' | null {
-  const otherKind = expectedKind === 'video' ? 'image' : 'video';
-  for (const tile of getLabsFxVisibleResourceTiles()) {
-    const media = otherKind === 'video'
-      ? tile.querySelector('video')
-      : tile.querySelector('img[alt="生成的图片"]');
-    if (!media) continue;
-    const key = tile.getAttribute('data-tile-id') || media.getAttribute('src') || '';
-    if (!key || previousKeys.has(key)) continue;
-    return otherKind;
-  }
-  return null;
-}
-
-function getLabsFxVisibleTiles(): HTMLElement[] {
-  const seen = new Set<string>();
-  const tiles: HTMLElement[] = [];
-  for (const tile of Array.from(document.querySelectorAll<HTMLElement>('[data-tile-id]'))) {
-    if (!isVisibleElement(tile)) continue;
-    const key = tile.getAttribute('data-tile-id') || '';
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    tiles.push(tile);
-  }
-  return tiles;
-}
-
-function getLabsFxNewFailedTile(previousKeys: Set<string>, handledFailureKeys: Set<string>): { tile: HTMLElement; key: string; retryBtn: HTMLElement | null; message: string } | null {
-  for (const tile of getLabsFxVisibleTiles()) {
-    const key = tile.getAttribute('data-tile-id') || '';
-    if (!key || previousKeys.has(key) || handledFailureKeys.has(key)) continue;
-    const text = (tile.textContent || '').trim();
-    const retryBtn = Array.from(tile.querySelectorAll<HTMLElement>('button')).find((btn) => {
-      const btnText = (btn.textContent || '').trim();
-      return btnText.includes('重试') || btnText.includes('refresh');
-    }) ?? null;
-    const hasFailureText = text.includes('失败');
-    const hasProgressPercent = /\b\d{1,3}%\b/.test(text);
-    if (!retryBtn && !hasFailureText) continue;
-    if (!retryBtn && hasProgressPercent) continue;
-    return { tile, key, retryBtn, message: text.slice(0, 240) };
-  }
-  return null;
-}
-
-function getLabsFxVisibleResourceTiles(): HTMLElement[] {
-  const seen = new Set<string>();
-  const tiles: HTMLElement[] = [];
-  for (const tile of getLabsFxVisibleTiles()) {
-    const media = tile.querySelector('img[alt="生成的图片"], video');
-    if (!media) continue;
-    const key = tile.getAttribute('data-tile-id') || media.getAttribute('src') || '';
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    tiles.push(tile);
-  }
-  return tiles;
-}
-
-async function waitForNewLabsFxImage(previousKeysInput: string[] | Set<string>, timeoutMs: number): Promise<HTMLImageElement> {
-  const deadline = Date.now() + timeoutMs;
-  const previousKeys = previousKeysInput instanceof Set ? previousKeysInput : new Set(previousKeysInput);
-  debugLog('labsfx 等待新图片', { previousKeys: Array.from(previousKeys), timeoutMs });
-  let lastSeenKeys = '';
-  while (Date.now() < deadline) {
-    const currentKeys = getLabsFxTileKeys();
-    const currentKeySummary = currentKeys.join(',');
-    if (currentKeySummary !== lastSeenKeys) {
-      lastSeenKeys = currentKeySummary;
-      debugLog('labsfx 当前资源列表 key', currentKeys);
-    }
-    const found = getLabsFxNewTile(previousKeys);
-    if (found && found.img.complete && found.img.naturalWidth > 0) {
-      debugLog('labsfx 新图片已就绪', { key: found.key, width: found.img.naturalWidth, height: found.img.naturalHeight });
-      return found.img;
-    }
-    await sleep(1000);
-  }
-  debugLog('labsfx 等待新图片超时', { previousKeys: Array.from(previousKeys), timeoutMs, currentKeys: getLabsFxTileKeys() });
-  throw new Error('wait for generated image timed out');
-}
-
-function isLabsFxMediaReady(mediaKind: 'image' | 'video', media: HTMLImageElement | HTMLVideoElement): boolean {
-  if (mediaKind === 'video') {
-    const video = media as HTMLVideoElement;
-    return !!video.getAttribute('src') && video.readyState >= 2;
-  }
-  const image = media as HTMLImageElement;
-  return image.complete && image.naturalWidth > 0;
-}
-
-async function waitForNewLabsFxGeneratedMedia(
-  mediaKind: 'image' | 'video',
-  previousKeysInput: string[] | Set<string>,
-  timeoutMs: number,
-  previousVideoStatusSeq = 0
-): Promise<HTMLImageElement | HTMLVideoElement> {
-  const startedAt = Date.now();
-  const deadline = Date.now() + timeoutMs;
-  const previousKeys = previousKeysInput instanceof Set ? previousKeysInput : new Set(previousKeysInput);
-  debugLog(`labsfx 等待新${mediaKind === 'video' ? '视频' : '图片'}`, { previousKeys: Array.from(previousKeys), timeoutMs });
-  let lastSeenKeys = '';
-  let lastLoggedKeysAt = 0;
-  const handledFailureKeys = new Set<string>();
-  let retryAttempts = 0;
-  const maxRetryAttempts = 2;
-  const pollIntervalMs = mediaKind === 'video' ? 250 : 1000;
-  const keyLogIntervalMs = mediaKind === 'video' ? 3000 : 0;
-  while (Date.now() < deadline) {
-    const currentKeys = getLabsFxTileKeys();
-    const currentKeySummary = currentKeys.join(',');
-    const now = Date.now();
-    const shouldLogKeys = currentKeySummary !== lastSeenKeys && (keyLogIntervalMs === 0 || now - lastLoggedKeysAt >= keyLogIntervalMs);
-    if (shouldLogKeys) {
-      lastSeenKeys = currentKeySummary;
-      lastLoggedKeysAt = now;
-      debugLog('labsfx 当前资源列表 key', currentKeys);
-    } else if (currentKeySummary !== lastSeenKeys) {
-      lastSeenKeys = currentKeySummary;
-    }
-    const found = getLabsFxNewMediaTile(previousKeys, mediaKind);
-    if (found && isLabsFxMediaReady(mediaKind, found.media)) {
-      if (mediaKind === 'video') {
-        const video = found.media as HTMLVideoElement;
-        debugLog('labsfx 新视频已就绪', { key: found.key, width: video.videoWidth, height: video.videoHeight });
-      } else {
-        const image = found.media as HTMLImageElement;
-        debugLog('labsfx 新图片已就绪', { key: found.key, width: image.naturalWidth, height: image.naturalHeight });
-      }
-      return found.media;
-    }
-    const unexpectedKind = getLabsFxUnexpectedNewMediaKind(previousKeys, mediaKind);
-    if (unexpectedKind) {
-      debugLog(`labsfx 检测到非预期新${unexpectedKind === 'video' ? '视频' : '图片'}`, {
-        expected: mediaKind,
-        actual: unexpectedKind,
-      });
-    }
-    if (mediaKind === 'video' && labsFxVideoStatusSeq > previousVideoStatusSeq) {
-      previousVideoStatusSeq = labsFxVideoStatusSeq;
-      if (labsFxLatestVideoStatus === 'MEDIA_GENERATION_STATUS_FAILED') {
-        const failedTile = getLabsFxNewFailedTile(previousKeys, handledFailureKeys);
-        if (failedTile && failedTile.retryBtn && retryAttempts < maxRetryAttempts) {
-          handledFailureKeys.add(failedTile.key);
-          retryAttempts += 1;
-          debugLog('labsfx 根据接口状态确认视频生成失败，触发重试', {
-            key: failedTile.key,
-            status: labsFxLatestVideoStatus,
-            attempt: retryAttempts,
-            error: labsFxLatestVideoError.slice(0, 240),
-          });
-          await clickElementLikeUser(failedTile.retryBtn);
-          await sleep(800);
-          continue;
-        }
-        throw new Error(`labs.google/fx video generation failed: ${labsFxLatestVideoError || labsFxLatestVideoStatus}`);
-      }
-    }
-    await sleep(pollIntervalMs);
-  }
-  debugLog(`labsfx 等待新${mediaKind === 'video' ? '视频' : '图片'}超时`, { previousKeys: Array.from(previousKeys), timeoutMs, currentKeys: getLabsFxTileKeys() });
-  throw new Error(`wait for generated ${mediaKind} timed out`);
-}
-
-function getLabsFxModeButton(editor: HTMLElement): HTMLElement | null {
-  const region = (editor.closest('.sc-84e494b2-0') ?? defaultEditorRegion(editor)) as Element | null;
-  if (!region) return null;
-  return Array.from(region.querySelectorAll<HTMLElement>('button[aria-haspopup="menu"]')).find((btn) => {
-    const text = (btn.textContent || '').trim();
-    return text.includes('视频') || text.includes('Nano') || text.includes('Banana');
-  }) ?? null;
-}
-
-async function ensureLabsFxMode(editor: HTMLElement, mediaKind: 'image' | 'video') {
-  const modeBtn = getLabsFxModeButton(editor);
-  if (!modeBtn) return;
-  const currentText = (modeBtn.textContent || '').trim();
-  const isVideoMode = currentText.includes('视频');
-  if (mediaKind === 'video' && isVideoMode) {
-    debugLog('labsfx 当前已处于视频模式');
-    return;
-  }
-  if (mediaKind === 'image' && !isVideoMode) {
-    debugLog('labsfx 当前已处于图片模式', { currentText: currentText.slice(0, 80) });
-    return;
-  }
-
-  debugLog(`labsfx 尝试切换到${mediaKind === 'video' ? '视频' : '图片'}模式`, { currentText: currentText.slice(0, 80) });
-  await clickElementLikeUser(modeBtn);
-  await sleep(300);
-
-  const candidates = Array.from(document.querySelectorAll<HTMLElement>('[role="menuitem"], [role="option"], button, div')).filter((el) => {
-    if (!isVisibleElement(el)) return false;
-    const text = (el.textContent || '').trim();
-    if (mediaKind === 'video') return text === '视频' || text.startsWith('视频');
-    return text === '图片' || text.startsWith('图片') || text.includes('Nano Banana');
-  });
-  if (candidates[0]) {
-    await clickElementLikeUser(candidates[0]);
-    await sleep(400);
-    debugLog(`labsfx 已切换到${mediaKind === 'video' ? '视频' : '图片'}模式`);
-    return;
-  }
-  debugLog(`labsfx 未找到${mediaKind === 'video' ? '视频' : '图片'}模式菜单项，继续使用当前模式`);
-}
-
-async function waitForElement<T extends Element>(selector: string, timeoutMs: number): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const el = document.querySelector(selector) as T | null;
-    if (el) return el;
-    await sleep(250);
-  }
-  throw new Error(`element not found: ${selector}`);
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function setGeminiPrompt(editor: HTMLElement, text: string) {
-  editor.focus();
-  const selection = window.getSelection();
-  if (selection) {
-    const range = document.createRange();
-    range.selectNodeContents(editor);
-    selection.removeAllRanges();
-    selection.addRange(range);
-  }
-  try { document.execCommand('delete', false); } catch {}
-  await sleep(80);
-  editor.focus();
-  try {
-    document.execCommand('insertText', false, text);
-  } catch {}
-  editor.dispatchEvent(new Event('input', { bubbles: true }));
-  editor.dispatchEvent(new Event('change', { bubbles: true }));
-  await sleep(120);
-  if (!getEditorText(editor).includes(text.trim())) {
-    editor.textContent = text;
-    editor.dispatchEvent(new Event('input', { bubbles: true }));
-    editor.dispatchEvent(new Event('change', { bubbles: true }));
-  }
-}
-
-function findGeminiComposerRegion(editor: Element | null): Element | null {
-  if (!editor) return null;
-  const selectors = [
-    'input-area-v2',
-    'fieldset',
-    'input-container',
-    '.text-input-field',
-    'form',
-    'message-composer',
-    '[role="group"]',
-    '[data-test-id*="composer"]',
-    '[data-testid*="composer"]',
-  ];
-  const candidates: Element[] = [];
-  for (const selector of selectors) {
-    const candidate = editor.closest(selector);
-    if (candidate && !candidates.includes(candidate)) candidates.push(candidate);
-  }
-  for (let node: Element | null = editor; node && node !== document.body; node = node.parentElement) {
-    if (!candidates.includes(node)) candidates.push(node);
-  }
-
-  const composerChromeSelector = [
-    getSiteConfig().sendBtn,
-    'button[aria-controls="upload-file-menu"]',
-    'input[type="file"]',
-    '.file-preview-container',
-    '.attachment-preview-wrapper',
-    'uploader-file-preview-container',
-    'uploader-file-preview',
-    '[data-test-id*="attachment"]',
-    '[data-testid*="attachment"]',
-  ].join(',');
-
-  for (const candidate of candidates) {
-    if (
-      candidate.matches('.text-input-field, input-area-v2, input-container')
-      || candidate.querySelector(composerChromeSelector)
-    ) {
-      return candidate;
-    }
-  }
-
-  return candidates[0] ?? null;
-}
-
-function getGeminiComposerRegion(editor: HTMLElement): Element | null {
-  return findGeminiComposerRegion(editor) ?? defaultEditorRegion(editor);
-}
-
-function isGeminiImageModeSelected(): boolean {
-  return Array.from(document.querySelectorAll<HTMLElement>('button')).some((button) => {
-    if (!isVisibleElement(button)) return false;
-    const label = `${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`;
-    return /取消选择.*制作图片/.test(label);
-  });
-}
-
-function getGeminiMakeImageButton(): HTMLElement | null {
-  const buttons = Array.from(document.querySelectorAll<HTMLElement>('button')).filter(isVisibleElement);
-  return buttons.find((button) => {
-    const label = `${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`.trim();
-    if (!label.includes('制作图片')) return false;
-    if (/取消选择/.test(label)) return false;
-    return true;
-  }) ?? null;
-}
-
-function getGeminiToolboxButton(): HTMLElement | null {
-  return Array.from(document.querySelectorAll<HTMLElement>('button')).find((button) => {
-    if (!isVisibleElement(button)) return false;
-    const label = `${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`.trim();
-    return label === '工具' || label.includes('工具');
-  }) ?? null;
-}
-
-async function ensureGeminiImageMode(editor: HTMLElement): Promise<boolean> {
-  if (isGeminiImageModeSelected()) return true;
-
-  let makeImageButton = getGeminiMakeImageButton();
-  if (!makeImageButton) {
-    const toolboxButton = getGeminiToolboxButton();
-    if (toolboxButton) {
-      debugLog('gemini 尝试打开工具菜单以选择制作图片');
-      await clickElementLikeUser(toolboxButton);
-      await sleep(300);
-      makeImageButton = getGeminiMakeImageButton();
-    }
-  }
-
-  if (!makeImageButton) {
-    debugLog('gemini 未找到制作图片入口', {
-      region: getGeminiAttachmentState(editor),
-    });
-    return false;
-  }
-
-  debugLog('gemini 选择制作图片模式', {
-    text: (makeImageButton.textContent || '').trim().slice(0, 80),
-    aria: makeImageButton.getAttribute('aria-label') || '',
-  });
-  await clickElementLikeUser(makeImageButton);
-  const deadline = Date.now() + 8000;
-  while (Date.now() < deadline) {
-    if (isGeminiImageModeSelected()) return true;
-    await sleep(250);
-  }
-  return isGeminiImageModeSelected();
-}
-
-function getGeminiUploadMenuButton(editor: HTMLElement): HTMLElement | null {
-  const region = getGeminiComposerRegion(editor);
-  const scopes = [region, document].filter(Boolean) as ParentNode[];
-  const selectors = [
-    'button[aria-controls="upload-file-menu"]',
-    'button[aria-haspopup="menu"][data-test-id*="upload"]',
-    'button[aria-label*="上传"]',
-    'button[aria-label*="Upload"]',
-    'button[aria-label*="附件"]',
-    'button[aria-label*="Attach"]',
-    'button[title*="上传"]',
-    'button[title*="Upload"]',
-    'button[title*="附件"]',
-    'button[title*="Attach"]',
-  ];
-  for (const scope of scopes) {
-    for (const selector of selectors) {
-      const button = Array.from(scope.querySelectorAll<HTMLElement>(selector)).find((el) => {
-        if (!isVisibleElement(el)) return false;
-        return !el.matches(getSiteConfig().sendBtn);
-      });
-      if (button) return button;
-    }
-    const button = Array.from(scope.querySelectorAll<HTMLElement>('button, div[role="button"], mat-icon')).find((el) => {
-      if (!isVisibleElement(el as HTMLElement)) return false;
-      const host = el instanceof HTMLElement ? el : el.parentElement;
-      if (!host || host.matches(getSiteConfig().sendBtn)) return false;
-      const label = `${host.getAttribute('aria-label') || ''} ${host.getAttribute('title') || ''} ${host.textContent || ''}`.toLowerCase();
-      if (label.includes('upload') || label.includes('上传') || label.includes('附件') || label.includes('attach')) {
-        return true;
-      }
-      const iconText = (host.querySelector('mat-icon, .google-symbols')?.textContent || '').trim().toLowerCase();
-      return iconText === 'upload' || iconText === 'file_upload' || iconText === 'attach_file' || iconText === 'add_2';
-    });
-    if (button) return button instanceof HTMLElement ? button : button.parentElement;
-  }
-  return null;
-}
-
-function findGeminiFileInput(editor?: HTMLElement): HTMLInputElement | null {
-  const region = editor ? getGeminiComposerRegion(editor) : null;
-  const scopes = [region, document].filter(Boolean) as ParentNode[];
-  for (const scope of scopes) {
-    const inputs = Array.from(scope.querySelectorAll<HTMLInputElement>('input[type="file"]')).filter((input) => input.isConnected && !input.disabled);
-    const imageInput = inputs.find((input) => {
-      const accept = (input.accept || '').toLowerCase();
-      return input.multiple || accept.includes('image/') || accept.includes('image');
-    });
-    if (imageInput) return imageInput;
-    if (inputs[0]) return inputs[0];
-  }
-  return null;
-}
-
-async function ensureGeminiFileInput(editor: HTMLElement): Promise<HTMLInputElement | null> {
-  const existing = findGeminiFileInput(editor);
-  if (existing) return existing;
-
-  const uploadBtn = getGeminiUploadMenuButton(editor);
-  if (uploadBtn) {
-    debugLog('gemini 尝试打开上传菜单');
-    await clickElementLikeUser(uploadBtn);
-    await sleep(250);
-  }
-
-  let input = findGeminiFileInput(editor);
-  if (input) return input;
-
-  return null;
-}
-
-function dispatchGeminiPasteFile(target: HTMLElement, file: File) {
-  const dataTransfer = new DataTransfer();
-  dataTransfer.items.add(file);
-  try {
-    target.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dataTransfer, bubbles: true, cancelable: true }));
-  } catch {}
-}
-
-function dispatchGeminiDropFile(target: HTMLElement, file: File) {
-  const dataTransfer = new DataTransfer();
-  dataTransfer.items.add(file);
-  const eventInit = { bubbles: true, cancelable: true, dataTransfer } as DragEventInit;
-  for (const type of ['dragenter', 'dragover', 'drop']) {
-    try {
-      target.dispatchEvent(new DragEvent(type, eventInit));
-    } catch {}
-  }
-}
-
-async function attachGeminiReferenceImageViaInjected(file: File): Promise<{ attached: boolean; count: number; mode: string; error?: string }> {
-  const requestId = `gemini-ref-${++geminiReferenceAttachSeq}-${Date.now()}`;
-  const dataBase64 = await blobToBase64(file);
-  return await new Promise((resolve, reject) => {
-    const timeout = window.setTimeout(() => {
-      cleanup();
-      reject(new Error('gemini injected reference attach timeout'));
-    }, 15000);
-    const onMessage = (event: MessageEvent) => {
-      if (event.source !== window) return;
-      const data = event.data || {};
-      if (data.type !== 'OPENLINK_GEMINI_ATTACH_REFERENCE_RESULT' || data.data?.requestId !== requestId) return;
-      cleanup();
-      if (data.data?.attached) {
-        resolve({
-          attached: true,
-          count: Number(data.data?.count || 0),
-          mode: String(data.data?.mode || ''),
-        });
-        return;
-      }
-      reject(new Error(String(data.data?.error || 'gemini injected reference attach failed')));
-    };
-    const cleanup = () => {
-      window.clearTimeout(timeout);
-      window.removeEventListener('message', onMessage);
-    };
-    window.addEventListener('message', onMessage);
-    window.postMessage({
-      type: 'OPENLINK_GEMINI_ATTACH_REFERENCE',
-      data: {
-        requestId,
-        fileName: file.name,
-        mimeType: file.type || 'image/png',
-        dataBase64,
-      },
-    }, '*');
-  });
-}
-
-function getGeminiAttachmentCount(editor: HTMLElement, input?: HTMLInputElement | null): number {
-  const region = getGeminiComposerRegion(editor);
-  const domCount = region ? getGeminiAttachmentRemoveButtons(editor).length : 0;
-  const fileCount = input?.files?.length || findGeminiFileInput(editor)?.files?.length || 0;
-  return Math.max(domCount, fileCount);
-}
-
-function getGeminiAttachmentRemoveButtons(editor: HTMLElement): HTMLElement[] {
-  const region = getGeminiComposerRegion(editor);
-  if (!region) return [];
-  const selectors = [
-    'button[data-test-id="cancel-button"]',
-    'button.cancel-button',
-    'button[aria-label*="移除附件"]',
-    'button[aria-label*="删除附件"]',
-    'button[aria-label*="Remove attachment"]',
-    'button[aria-label*="Delete attachment"]',
-    'button[aria-label*="移除图片"]',
-    'button[aria-label*="Remove image"]',
-    'button[aria-label*="移除文件"]',
-    'button[aria-label*="Remove file"]',
-    '.attachment-preview-wrapper button[data-test-id="cancel-button"]',
-    'uploader-file-preview button[data-test-id="cancel-button"]',
-    '.file-preview-chip button[data-test-id="cancel-button"]',
-  ];
-  const seen = new Set<HTMLElement>();
-  const buttons: HTMLElement[] = [];
-  for (const selector of selectors) {
-    for (const button of Array.from(region.querySelectorAll<HTMLElement>(selector))) {
-      if (seen.has(button) || !isVisibleElement(button)) continue;
-      const label = `${button.getAttribute('aria-label') || ''} ${button.getAttribute('title') || ''} ${button.textContent || ''}`.toLowerCase();
-      if (!label && !button.closest('.attachment-preview-wrapper, uploader-file-preview, .file-preview-chip')) continue;
-      seen.add(button);
-      buttons.push(button);
-    }
-  }
-  return buttons;
-}
-
-function isGeminiUploadMenuOpen(): boolean {
-  const menu = document.querySelector('#upload-file-menu');
-  if (menu instanceof HTMLElement && isVisibleElement(menu)) return true;
-  return Array.from(document.querySelectorAll<HTMLElement>('button[aria-controls="upload-file-menu"]')).some((button) => button.getAttribute('aria-expanded') === 'true');
-}
-
-function getGeminiVisiblePreviewImages(editor: HTMLElement): HTMLImageElement[] {
-  const region = getGeminiComposerRegion(editor);
-  if (!region) return [];
-  return Array.from(region.querySelectorAll<HTMLImageElement>('img[data-test-id="image-preview"], .file-preview-container img, uploader-file-preview img'))
-    .filter((img) => {
-      const src = img.getAttribute('src') || '';
-      return !!src && isVisibleElement(img);
-    });
-}
-
-function getGeminiAttachmentState(editor: HTMLElement, input?: HTMLInputElement | null) {
-  const region = getGeminiComposerRegion(editor);
-  const previewImages = getGeminiVisiblePreviewImages(editor);
-  return {
-    regionTag: region?.tagName?.toLowerCase() || '',
-    regionClass: region instanceof HTMLElement ? String(region.className || '').slice(0, 160) : '',
-    count: getGeminiAttachmentCount(editor, input),
-    removeButtons: getGeminiAttachmentRemoveButtons(editor).length,
-    menuOpen: isGeminiUploadMenuOpen(),
-    previewImages: previewImages.map((img) => ({
-      src: (img.getAttribute('src') || '').slice(0, 80),
-      complete: img.complete,
-      width: img.naturalWidth || 0,
-      height: img.naturalHeight || 0,
-    })),
-  };
-}
-
-async function waitForGeminiAttachmentCount(editor: HTMLElement, expectedCount: number, timeoutMs: number, input?: HTMLInputElement | null): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (getGeminiAttachmentCount(editor, input) >= expectedCount) return true;
-    await sleep(200);
-  }
-  return false;
-}
-
-async function waitForGeminiAttachmentReady(editor: HTMLElement, expectedCount: number, timeoutMs: number, input?: HTMLInputElement | null): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  let stableSince = 0;
-  let lastLogAt = 0;
-  while (Date.now() < deadline) {
-    const state = getGeminiAttachmentState(editor, input);
-    const hasLoadedPreview = state.previewImages.length >= expectedCount && state.previewImages.every((img) => {
-      return !!img.src && (img.src.startsWith('blob:') || img.src.startsWith('data:') || img.complete);
-    });
-    const ready = state.count >= expectedCount && state.removeButtons >= expectedCount && hasLoadedPreview && !state.menuOpen;
-    if (Date.now() - lastLogAt >= 1000) {
-      lastLogAt = Date.now();
-      debugLog('gemini 等待参考图稳定', {
-        expectedCount,
-        ready,
-        ...state,
-      });
-    }
-    if (ready) {
-      if (!stableSince) stableSince = Date.now();
-      if (Date.now() - stableSince >= 1200) return true;
-    } else {
-      stableSince = 0;
-    }
-    await sleep(200);
-  }
-  return false;
-}
-
-async function clearGeminiReferenceImages(editor: HTMLElement) {
-  const input = findGeminiFileInput(editor);
-  if (input && input.files?.length) {
-    setFileInputFiles(input, []);
-    await sleep(100);
-  }
-
-  for (let pass = 0; pass < 4; pass++) {
-    const buttons = getGeminiAttachmentRemoveButtons(editor);
-    if (buttons.length === 0) break;
-    for (const button of buttons) {
-      await clickElementLikeUser(button);
-      await sleep(120);
-    }
-    if (getGeminiAttachmentCount(editor, input) === 0) return;
-    await sleep(250);
-  }
-}
-
-async function attachGeminiReferenceImages(editor: HTMLElement, items: any[], apiUrl: string, authToken: string) {
-  const files = await Promise.all(items.map((item, index) => referenceImageJobToFile(item, index, apiUrl, authToken)));
-  const beforeCount = getGeminiAttachmentCount(editor);
-  const target = (getGeminiComposerRegion(editor) as HTMLElement | null) ?? editor;
-  debugLog('gemini 开始附加参考图', {
-    count: files.length,
-    beforeCount,
-    files: files.map((file) => ({ name: file.name, size: file.size, type: file.type })),
-  });
-  let expectedCount = beforeCount;
-  for (let i = 0; i < files.length; i++) {
-    const file = files[i];
-    let attached = false;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const input = await ensureGeminiFileInput(editor);
-      debugLog('gemini 附加参考图', {
-        index: i + 1,
-        attempt,
-        expectedCount: expectedCount + 1,
-        fileName: file.name,
-        size: file.size,
-        type: file.type,
-        hasFileInput: !!input,
-      });
-      if (input) {
-        setFileInputFiles(input, [file]);
-        if (
-          await waitForGeminiAttachmentCount(editor, expectedCount + 1, 15000, input) &&
-          await waitForGeminiAttachmentReady(editor, expectedCount + 1, 10000, input)
-        ) {
-          expectedCount += 1;
-          attached = true;
-          break;
-        }
-        debugLog('gemini 文件输入上传未生效，准备回退', { index: i + 1, attempt, fileName: file.name });
-      } else {
-        debugLog('gemini 未发现 file input，直接回退到 paste/drop', { index: i + 1, attempt, fileName: file.name });
-      }
-      dispatchGeminiPasteFile(editor, file);
-      if (
-        await waitForGeminiAttachmentCount(editor, expectedCount + 1, 5000, input) &&
-        await waitForGeminiAttachmentReady(editor, expectedCount + 1, 10000, input)
-      ) {
-        expectedCount += 1;
-        attached = true;
-        break;
-      }
-      dispatchGeminiDropFile(target, file);
-      if (
-        await waitForGeminiAttachmentCount(editor, expectedCount + 1, 5000, input) &&
-        await waitForGeminiAttachmentReady(editor, expectedCount + 1, 10000, input)
-      ) {
-        expectedCount += 1;
-        attached = true;
-        break;
-      }
-      try {
-        const injected = await attachGeminiReferenceImageViaInjected(file);
-        debugLog('gemini 页面上下文参考图注入完成', {
-          index: i + 1,
-          attempt,
-          fileName: file.name,
-          count: injected.count,
-          mode: injected.mode,
-        });
-        if (injected.attached) {
-          const stabilized = await waitForGeminiAttachmentReady(editor, expectedCount + 1, 15000, input);
-          debugLog('gemini 页面上下文参考图稳定检查', {
-            index: i + 1,
-            attempt,
-            stabilized,
-            ...getGeminiAttachmentState(editor, input),
-          });
-          if (stabilized) {
-            expectedCount += 1;
-            attached = true;
-            break;
-          }
-        }
-      } catch (error) {
-        debugLog('gemini 页面上下文参考图注入失败', {
-          index: i + 1,
-          attempt,
-          fileName: file.name,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      await sleep(250);
-    }
-    if (!attached) {
-      throw new Error(`gemini reference image attach failed: ${file.name}`);
-    }
-  }
-}
-
-async function blobToBase64(blob: Blob): Promise<string> {
-  const buffer = await blob.arrayBuffer();
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
-
-function guessImageExtension(mimeType: string, src: string): string {
-  const lowerMime = mimeType.toLowerCase();
-  if (lowerMime.includes('png')) return '.png';
-  if (lowerMime.includes('jpeg') || lowerMime.includes('jpg')) return '.jpg';
-  if (lowerMime.includes('webp')) return '.webp';
-  const match = src.match(/\.(png|jpe?g|webp|gif)(?:$|\?)/i);
-  return match ? `.${match[1].toLowerCase() === 'jpeg' ? 'jpg' : match[1].toLowerCase()}` : '.png';
-}
-
-function guessMediaExtension(mimeType: string, src: string): string {
-  const lowerMime = mimeType.toLowerCase();
-  if (lowerMime.includes('video/mp4')) return '.mp4';
-  if (lowerMime.includes('video/webm')) return '.webm';
-  if (lowerMime.includes('video/quicktime')) return '.mov';
-  const videoMatch = src.match(/\.(mp4|webm|mov|m4v)(?:$|\?)/i);
-  if (videoMatch) return `.${videoMatch[1].toLowerCase()}`;
-  return guessImageExtension(mimeType, src);
-}
-
-function getLatestGeminiImageResponseContainer(): Element | null {
-  const messageContents = Array.from(document.querySelectorAll('message-content'));
-  for (let i = messageContents.length - 1; i >= 0; i--) {
-    const message = messageContents[i];
-    if (message.querySelector('.attachment-container.generated-images img.image')) return message;
-  }
-  return null;
-}
-
-function getGeminiGeneratedImageElements(): HTMLImageElement[] {
-  const latestMessage = getLatestGeminiImageResponseContainer();
-  if (!latestMessage) return [];
-  return Array.from(latestMessage.querySelectorAll<HTMLImageElement>('generated-image img.image.loaded, .attachment-container.generated-images img.image.loaded'))
-    .filter((img) => isVisibleElement(img) && !!img.getAttribute('src'));
-}
-
-function getGeminiImageKeys(): string[] {
-  return getGeminiGeneratedImageElements()
-    .map((img) => img.getAttribute('src') || '')
-    .filter(Boolean);
-}
-
-async function waitForGeminiOriginalMediaURL(previousSeq: number, timeoutMs: number): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  debugLog('gemini 等待无水印原图 URL', { previousSeq, timeoutMs });
-  while (Date.now() < deadline) {
-    if (geminiMediaSeq > previousSeq && geminiLatestMediaURLs.length > 0) {
-      const url = geminiLatestMediaURLs[geminiLatestMediaURLs.length - 1];
-      if (url) return url;
-    }
-    await sleep(500);
-  }
-  throw new Error('wait for gemini original media url timed out');
-}
-
-async function waitForNewGeminiImage(previousKeysInput: string[] | Set<string>, timeoutMs: number): Promise<HTMLImageElement> {
-  const deadline = Date.now() + timeoutMs;
-  const previousKeys = previousKeysInput instanceof Set ? previousKeysInput : new Set(previousKeysInput);
-  debugLog('gemini 等待新图片', { previousKeys: Array.from(previousKeys), timeoutMs });
-  let lastSeenKeys = '';
-  while (Date.now() < deadline) {
-    const currentKeys = getGeminiImageKeys();
-    const currentKeySummary = currentKeys.join(',');
-    if (currentKeySummary !== lastSeenKeys) {
-      lastSeenKeys = currentKeySummary;
-      debugLog('gemini 当前图片 key', currentKeys);
-    }
-    const images = getGeminiGeneratedImageElements();
-    for (let i = images.length - 1; i >= 0; i--) {
-      const img = images[i];
-      const key = img.getAttribute('src') || '';
-      if (!key || previousKeys.has(key)) continue;
-      if (key.startsWith('blob:') || (img.complete && img.naturalWidth > 0)) {
-        debugLog('gemini 新图片已就绪', { key, width: img.naturalWidth, height: img.naturalHeight });
-        return img;
-      }
-    }
-    await sleep(1000);
-  }
-  debugLog('gemini 等待新图片超时', { previousKeys: Array.from(previousKeys), timeoutMs, currentKeys: getGeminiImageKeys() });
-  throw new Error('wait for gemini generated image timed out');
-}
-
 async function sendInitPrompt() {
   const { authToken, apiUrl } = await chrome.storage.local.get(['authToken', 'apiUrl']);
   if (!apiUrl) { alert('请先在插件中配置 API 地址'); return; }
@@ -4750,30 +1921,6 @@ async function fillAiStudioSystemInstructions(prompt: string) {
 
   const closeBtn = document.querySelector<HTMLElement>('button[data-test-close-button]');
   if (closeBtn) closeBtn.click();
-}
-
-function showQuestionPopup(question: string, options: string[]): Promise<string> {
-  return new Promise(resolve => {
-    const overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2147483647;display:flex;align-items:center;justify-content:center';
-    const box = document.createElement('div');
-    box.style.cssText = 'background:#1e1e2e;color:#cdd6f4;border-radius:12px;padding:24px;max-width:480px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.5)';
-    const title = document.createElement('p');
-    title.style.cssText = 'margin:0 0 16px;font-size:15px;line-height:1.5;white-space:pre-wrap';
-    title.textContent = question;
-    box.appendChild(title);
-    options.forEach((opt, i) => {
-      const btn = document.createElement('button');
-      btn.textContent = `${i + 1}. ${opt}`;
-      btn.style.cssText = 'display:block;width:100%;margin-bottom:8px;padding:10px 14px;background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:8px;cursor:pointer;font-size:13px;text-align:left';
-      btn.onmouseenter = () => { btn.style.background = '#45475a'; };
-      btn.onmouseleave = () => { btn.style.background = '#313244'; };
-      btn.onclick = () => { overlay.remove(); resolve(opt); };
-      box.appendChild(btn);
-    });
-    overlay.appendChild(box);
-    document.body.appendChild(overlay);
-  });
 }
 
 async function executeToolCall(toolCall: any) {
@@ -4819,60 +1966,11 @@ async function executeToolCall(toolCall: any) {
   }
 }
 
-function showToast(msg: string, durationMs = 3000): void {
-  const toast = document.createElement('div');
-  toast.style.cssText = 'position:fixed;bottom:170px;right:20px;z-index:2147483647;background:#1e1e2e;color:#a6e3a1;border:1px solid #a6e3a1;border-radius:10px;padding:10px 16px;font-size:13px;box-shadow:0 4px 16px rgba(0,0,0,0.4)';
-  toast.textContent = msg;
-  document.body.appendChild(toast);
-  setTimeout(() => toast.remove(), durationMs);
-}
-
 function clickStopButton(): void {
   const stopSel = getSiteConfig().stopBtn;
   if (!stopSel) return;
   const btn = document.querySelector(stopSel) as HTMLElement;
   if (btn) btn.click();
-}
-
-function showCountdownToast(ms: number, onFire: () => void): void {
-  const toast = document.createElement('div');
-  toast.style.cssText = 'position:fixed;bottom:130px;right:20px;z-index:2147483647;background:#1e1e2e;color:#cdd6f4;border:1px solid #45475a;border-radius:10px;padding:10px 14px;font-size:13px;display:flex;align-items:center;gap:10px;box-shadow:0 4px 16px rgba(0,0,0,0.4)';
-  const label = document.createElement('span');
-  const cancelBtn = document.createElement('button');
-  cancelBtn.textContent = '取消';
-  cancelBtn.style.cssText = 'background:#313244;color:#f38ba8;border:1px solid #f38ba8;border-radius:6px;padding:2px 8px;cursor:pointer;font-size:12px';
-  toast.appendChild(label);
-  toast.appendChild(cancelBtn);
-  document.body.appendChild(toast);
-
-  let remaining = Math.ceil(ms / 1000);
-  let cancelled = false;
-  label.textContent = `${remaining}s 后自动提交`;
-  const interval = setInterval(() => {
-    remaining--;
-    label.textContent = `${remaining}s 后自动提交`;
-    if (remaining <= 0) { clearInterval(interval); toast.remove(); if (!cancelled) onFire(); }
-  }, 1000);
-  cancelBtn.onclick = () => { cancelled = true; clearInterval(interval); toast.remove(); };
-}
-
-function querySelectorFirst(selectors: string): HTMLElement | null {
-  for (const sel of selectors.split(',').map(s => s.trim())) {
-    const el = document.querySelector(sel) as HTMLElement | null;
-    if (el) return el;
-  }
-  return null;
-}
-
-function isVisibleElement(el: HTMLElement): boolean {
-  const rect = el.getBoundingClientRect();
-  const style = window.getComputedStyle(el);
-  if (el.getAttribute('aria-hidden') === 'true') return false;
-  if (el.getAttribute('tabindex') === '-1') return false;
-  if (style.visibility === 'hidden') return false;
-  if (style.display === 'none') return false;
-  if (style.opacity === '0') return false;
-  return rect.width > 0 && rect.height > 0;
 }
 
 function scoreEditorCandidate(el: HTMLElement): number {
@@ -4883,24 +1981,6 @@ function scoreEditorCandidate(el: HTMLElement): number {
   const submitBtn = getSendButtonForEditor(el, getSiteConfig().sendBtn);
   const submitScore = submitBtn && !(submitBtn as HTMLButtonElement).disabled ? 2_000_000 : submitBtn ? 1_000_000 : 0;
   return submitScore + (inViewport ? 500_000 : 0) + nearBottom * 100 + area;
-}
-
-function getEditorCandidates(editorSel: string): HTMLElement[] {
-  const selectors = editorSel.split(',').map(s => s.trim()).filter(Boolean);
-  const candidates = selectors.flatMap(sel => Array.from(document.querySelectorAll<HTMLElement>(sel)));
-  return candidates
-    .filter((el) => {
-      if (!el.isConnected) return false;
-      if (el instanceof HTMLTextAreaElement && (el.disabled || el.readOnly)) return false;
-      if (!isVisibleElement(el)) return false;
-      return true;
-    });
-}
-
-function getVisibleTextareas(): HTMLTextAreaElement[] {
-  return Array.from(document.querySelectorAll('textarea')).filter((el): el is HTMLTextAreaElement => {
-    return el instanceof HTMLTextAreaElement && isVisibleElement(el);
-  });
 }
 
 function getCurrentEditor(editorSel: string): HTMLElement | null {
@@ -4917,22 +1997,6 @@ function getCurrentEditor(editorSel: string): HTMLElement | null {
 
 function getSendButtonForEditor(editor: HTMLElement, sendBtnSel: string): HTMLElement | null {
   return getSiteAdapter().getSendButton(editor, sendBtnSel);
-}
-
-function applyTextareaValue(ta: HTMLTextAreaElement, next: string): void {
-  const previous = ta.value;
-  const nativeInputValueSetter = getNativeSetter();
-  if (nativeInputValueSetter) nativeInputValueSetter.call(ta, next);
-  else ta.value = next;
-  const tracker = (ta as any)._valueTracker;
-  if (tracker && typeof tracker.setValue === 'function') tracker.setValue(previous);
-  const caret = next.length;
-  try { ta.setSelectionRange(caret, caret); } catch {}
-  ta.dispatchEvent(new Event('focus', { bubbles: true }));
-  ta.dispatchEvent(new Event('input', { bubbles: true }));
-  ta.dispatchEvent(new Event('change', { bubbles: true }));
-  if (location.hostname !== 'chat.deepseek.com') ta.dispatchEvent(new Event('blur', { bubbles: true }));
-  ta.dispatchEvent(new KeyboardEvent('keyup', { key: 'End', code: 'End', bubbles: true }));
 }
 
 async function fillArenaTextarea(result: string, editorSel: string, sendBtnSel: string): Promise<HTMLTextAreaElement | null> {
@@ -5045,306 +2109,4 @@ async function fillAndSend(result: string, autoSend = false) {
       checkAndClick();
     });
   }
-}
-
-// ── 斜杠命令 / @ 文件补全 ──────────────────────────────────────────────────────
-
-let skillsCache: Array<{ name: string; description: string }> | null = null;
-let skillsCacheTime = 0;
-const filesCache = new Map<string, { ts: number; files: string[] }>();
-const FILES_TTL = 5000;
-
-async function fetchSkills(): Promise<Array<{ name: string; description: string }>> {
-  if (skillsCache && Date.now() - skillsCacheTime < 30000) return skillsCache;
-  const { authToken, apiUrl } = await chrome.storage.local.get(['authToken', 'apiUrl']);
-  if (!apiUrl) return [];
-  const headers: any = {};
-  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-  try {
-    const resp = await bgFetch(`${apiUrl}/skills`, { headers });
-    if (!resp.ok) return [];
-    const data = JSON.parse(resp.body);
-    skillsCache = data.skills || [];
-    skillsCacheTime = Date.now();
-    return skillsCache!;
-  } catch { return []; }
-}
-
-async function fetchFiles(q: string): Promise<string[]> {
-  const cached = filesCache.get(q);
-  if (cached && Date.now() - cached.ts < FILES_TTL) return cached.files;
-  const { authToken, apiUrl } = await chrome.storage.local.get(['authToken', 'apiUrl']);
-  if (!apiUrl) return [];
-  const headers: any = {};
-  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-  try {
-    const resp = await bgFetch(`${apiUrl}/files?q=${encodeURIComponent(q)}`, { headers });
-    if (!resp.ok) return [];
-    const data = JSON.parse(resp.body);
-    const files = data.files || [];
-    filesCache.set(q, { ts: Date.now(), files });
-    return files;
-  } catch { return []; }
-}
-
-function showPickerPopup(
-  anchorEl: HTMLElement,
-  items: Array<{ label: string; sub?: string; value: string }>,
-  onSelect: (value: string) => void,
-  onDismiss: () => void
-): () => void {
-  const popup = document.createElement('div');
-  popup.style.cssText = 'position:fixed;z-index:2147483647;background:#1e1e2e;border:1px solid #45475a;border-radius:8px;padding:4px;min-width:240px;max-width:400px;max-height:240px;overflow-y:auto;box-shadow:0 4px 16px rgba(0,0,0,0.5)';
-
-  let activeIdx = 0;
-  const rows: HTMLElement[] = [];
-
-  function render() {
-    popup.innerHTML = '';
-    rows.length = 0;
-    if (items.length === 0) {
-      const empty = document.createElement('div');
-      empty.style.cssText = 'padding:8px 12px;color:#6c7086;font-size:12px';
-      empty.textContent = '无匹配项';
-      popup.appendChild(empty);
-      return;
-    }
-    items.forEach((item, i) => {
-      const row = document.createElement('div');
-      row.style.cssText = `padding:6px 12px;border-radius:6px;cursor:pointer;display:flex;flex-direction:column;gap:2px;background:${i === activeIdx ? '#313244' : 'transparent'}`;
-      const label = document.createElement('span');
-      label.style.cssText = 'color:#cdd6f4;font-size:13px';
-      label.textContent = item.label;
-      row.appendChild(label);
-      if (item.sub) {
-        const sub = document.createElement('span');
-        sub.style.cssText = 'color:#6c7086;font-size:11px';
-        sub.textContent = item.sub;
-        row.appendChild(sub);
-      }
-      row.onmouseenter = () => { setActive(i); };
-      row.onclick = () => { onSelect(item.value); destroy(); };
-      rows.push(row);
-      popup.appendChild(row);
-    });
-  }
-
-  function setActive(i: number) {
-    if (rows[activeIdx]) rows[activeIdx].style.background = 'transparent';
-    activeIdx = i;
-    if (rows[activeIdx]) {
-      rows[activeIdx].style.background = '#313244';
-      rows[activeIdx].scrollIntoView({ block: 'nearest' });
-    }
-  }
-
-  function reposition() {
-    const rect = anchorEl.getBoundingClientRect();
-    const popupH = Math.min(240, popup.scrollHeight || 240);
-    const spaceAbove = rect.top - 6;
-    const spaceBelow = window.innerHeight - rect.bottom - 6;
-    if (spaceAbove >= popupH || spaceAbove >= spaceBelow) {
-      popup.style.top = `${Math.max(4, rect.top - popupH - 6)}px`;
-    } else {
-      popup.style.top = `${rect.bottom + 6}px`;
-    }
-    popup.style.left = `${rect.left}px`;
-    popup.style.width = `${Math.min(400, rect.width)}px`;
-  }
-
-  render();
-  document.body.appendChild(popup);
-  reposition();
-
-  function onKeyDown(e: KeyboardEvent) {
-    if (!items.length) return;
-    if (e.key === 'ArrowDown') { e.preventDefault(); e.stopPropagation(); setActive((activeIdx + 1) % items.length); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); e.stopPropagation(); setActive((activeIdx - 1 + items.length) % items.length); }
-    else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); onSelect(items[activeIdx].value); destroy(); }
-    else if (e.key === 'Escape') { onDismiss(); destroy(); }
-  }
-
-  function onMouseDown(e: MouseEvent) {
-    if (!popup.contains(e.target as Node)) { onDismiss(); destroy(); }
-  }
-
-  document.addEventListener('keydown', onKeyDown, true);
-  document.addEventListener('mousedown', onMouseDown, true);
-  window.addEventListener('scroll', reposition, true);
-  window.addEventListener('resize', reposition);
-
-  function destroy() {
-    popup.remove();
-    document.removeEventListener('keydown', onKeyDown, true);
-    document.removeEventListener('mousedown', onMouseDown, true);
-    window.removeEventListener('scroll', reposition, true);
-    window.removeEventListener('resize', reposition);
-  }
-
-  return destroy;
-}
-
-function getEditorText(el: HTMLElement): string {
-  if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-    return (el as HTMLTextAreaElement).value;
-  }
-  return el.innerText || '';
-}
-
-function getCaretPosition(el: HTMLElement): number {
-  if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-    return (el as HTMLTextAreaElement).selectionStart ?? 0;
-  }
-  const sel = window.getSelection();
-  if (!sel || sel.rangeCount === 0) return 0;
-  const range = sel.getRangeAt(0).cloneRange();
-  range.selectNodeContents(el);
-  range.setEnd(sel.getRangeAt(0).endContainer, sel.getRangeAt(0).endOffset);
-  return range.toString().length;
-}
-
-function replaceTokenInEditor(el: HTMLElement, token: string, replacement: string, fillMethod: string) {
-  if (fillMethod === 'value') {
-    const ta = el as HTMLTextAreaElement;
-    const val = ta.value;
-    const pos = ta.selectionStart ?? val.length;
-    const before = val.slice(0, pos);
-    const after = val.slice(pos);
-    const tokenStart = before.lastIndexOf(token);
-    if (tokenStart === -1) return;
-    const newVal = val.slice(0, tokenStart) + replacement + after;
-    const nativeSetter = getNativeSetter();
-    if (nativeSetter) nativeSetter.call(ta, newVal);
-    else ta.value = newVal;
-    const newCaret = tokenStart + replacement.length;
-    ta.setSelectionRange(newCaret, newCaret);
-    ta.dispatchEvent(new Event('input', { bubbles: true }));
-  } else if (fillMethod === 'execCommand' || fillMethod === 'prosemirror') {
-    // prosemirror 也通过 execCommand insertText 拦截，不能直接写 innerHTML
-    const sel = window.getSelection();
-    if (!sel || sel.rangeCount === 0) return;
-    const range = sel.getRangeAt(0);
-    const text = getEditorText(el);
-    const pos = getCaretPosition(el);
-    const before = text.slice(0, pos);
-    const tokenStart = before.lastIndexOf(token);
-    if (tokenStart === -1) return;
-    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-    let charCount = 0;
-    let startNode: Text | null = null, startOffset = 0;
-    let endNode: Text | null = null, endOffset = 0;
-    while (walker.nextNode()) {
-      const node = walker.currentNode as Text;
-      const len = node.textContent?.length ?? 0;
-      if (!startNode && charCount + len > tokenStart) {
-        startNode = node;
-        startOffset = tokenStart - charCount;
-      }
-      if (startNode && !endNode && charCount + len >= tokenStart + token.length) {
-        endNode = node;
-        endOffset = tokenStart + token.length - charCount;
-        break;
-      }
-      charCount += len;
-    }
-    if (startNode && endNode) {
-      range.setStart(startNode, startOffset);
-      range.setEnd(endNode, endOffset);
-      sel.removeAllRanges();
-      sel.addRange(range);
-      document.execCommand('insertText', false, replacement);
-    }
-  } else {
-    // paste fallback (DeepSeek/Slate)：先删除 token，再粘贴
-    const ta = el as HTMLTextAreaElement;
-    const val = ta.tagName === 'TEXTAREA' ? ta.value : el.innerText;
-    const tokenStart = val.lastIndexOf(token);
-    if (tokenStart !== -1 && ta.tagName === 'TEXTAREA') {
-      const newVal = val.slice(0, tokenStart) + val.slice(tokenStart + token.length);
-      const nativeSetter = getNativeSetter();
-      if (nativeSetter) nativeSetter.call(ta, newVal);
-      else ta.value = newVal;
-      ta.setSelectionRange(tokenStart, tokenStart);
-      ta.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-    const dataTransfer = new DataTransfer();
-    dataTransfer.setData('text/plain', replacement);
-    el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dataTransfer, bubbles: true, cancelable: true }));
-  }
-}
-
-function attachInputListener(editorEl: HTMLElement) {
-  if ((editorEl as any).__openlinkInputBound) return;
-  (editorEl as any).__openlinkInputBound = true;
-  const { fillMethod } = getSiteConfig();
-  let destroyPicker: (() => void) | null = null;
-  let inputVersion = 0;
-
-  function dismiss() {
-    if (destroyPicker) { destroyPicker(); destroyPicker = null; }
-  }
-
-  editorEl.addEventListener('input', async () => {
-    const currentVersion = ++inputVersion;
-    const text = getEditorText(editorEl);
-    const pos = getCaretPosition(editorEl);
-    const before = text.slice(0, pos);
-
-    const slashMatch = before.match(/(?:^|[\s\n\u00a0])(\/([\w-]*))$/);
-    if (slashMatch) {
-      const token = slashMatch[1];
-      const query = slashMatch[2].toLowerCase();
-      const skills = await fetchSkills();
-      if (currentVersion !== inputVersion) return;
-      const filtered = query
-        ? skills.filter(s => s.name.toLowerCase().includes(query) || s.description.toLowerCase().includes(query))
-        : skills;
-      dismiss();
-      if (filtered.length === 0) return;
-      destroyPicker = showPickerPopup(
-        editorEl,
-        filtered.map(s => ({
-          label: s.name,
-          sub: s.description,
-          value: `<tool name="skill">\n  <parameter name="skill">${s.name}</parameter>\n</tool>`,
-        })),
-        (xml) => { replaceTokenInEditor(editorEl, token, xml, fillMethod); dismiss(); },
-        dismiss
-      );
-      return;
-    }
-
-    const atMatch = before.match(/@([^\s]*)$/);
-    if (atMatch) {
-      const token = atMatch[0];
-      const query = atMatch[1];
-      const files = await fetchFiles(query);
-      if (currentVersion !== inputVersion) return;
-      dismiss();
-      if (files.length === 0) return;
-      destroyPicker = showPickerPopup(
-        editorEl,
-        files.map(f => ({ label: f, value: f })),
-        (path) => { replaceTokenInEditor(editorEl, token, path, fillMethod); dismiss(); },
-        dismiss
-      );
-      return;
-    }
-
-    dismiss();
-  });
-}
-
-function mountInputListener() {
-  const { editor: editorSel } = getSiteConfig();
-
-  const attachCurrent = () => {
-    const editorEl = getCurrentEditor(editorSel);
-    if (editorEl) attachInputListener(editorEl);
-  };
-
-  attachCurrent();
-
-  const obs = new MutationObserver(() => attachCurrent());
-  obs.observe(document.body, { childList: true, subtree: true });
 }
