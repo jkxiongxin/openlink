@@ -52,6 +52,9 @@ function tryParseToolJSON(raw: string): any | null {
   let geminiMediaCaptureActive = false;
   let flowCapturedHeaders = {};
   let flowCapturedProjectId = '';
+  let captchaCacheEnabled = false;
+  let captchaCachePushURL = '';
+  let captchaCacheAuthToken = '';
 
   // Global dedup: keyed by conversation ID extracted from URL
   const processedByConv = new Map<string, Set<string>>();
@@ -425,6 +428,211 @@ function tryParseToolJSON(raw: string): any | null {
         },
       }, '*');
     } catch {}
+  }
+
+  function normalizeCaptchaAction(value: string): 'IMAGE_GENERATION' | 'VIDEO_GENERATION' {
+    return value === 'VIDEO_GENERATION' ? 'VIDEO_GENERATION' : 'IMAGE_GENERATION';
+  }
+
+  function getCaptchaCacheActionForURL(url: string): 'IMAGE_GENERATION' | 'VIDEO_GENERATION' | '' {
+    if (url.includes('/flowMedia:batchGenerateImages')) return 'IMAGE_GENERATION';
+    if (
+      url.includes('/video:batchAsyncGenerateVideoText') ||
+      url.includes('/video:batchAsyncGenerateVideoReferenceImages') ||
+      url.includes('/video:batchAsyncGenerateVideoStartAndEndImage') ||
+      url.includes('/video:batchAsyncGenerateVideoStartImage')
+    ) {
+      return 'VIDEO_GENERATION';
+    }
+    return '';
+  }
+
+  function extractRecaptchaTokenFromBody(bodyText: string): string {
+    if (!bodyText) return '';
+    try {
+      const payload = JSON.parse(bodyText);
+      const token = payload?.clientContext?.recaptchaContext?.token;
+      if (typeof token === 'string' && token.length > 10) return token;
+      if (Array.isArray(payload?.requests)) {
+        for (const req of payload.requests) {
+          const nested = req?.clientContext?.recaptchaContext?.token;
+          if (typeof nested === 'string' && nested.length > 10) return nested;
+        }
+      }
+      return '';
+    } catch {
+      return '';
+    }
+  }
+
+  function countChineseCharacters(text: string): number {
+    let count = 0;
+    for (const char of text) {
+      const codePoint = char.codePointAt(0) || 0;
+      if (
+        (codePoint >= 0x3400 && codePoint <= 0x4DBF) ||
+        (codePoint >= 0x4E00 && codePoint <= 0x9FFF) ||
+        (codePoint >= 0xF900 && codePoint <= 0xFAFF) ||
+        (codePoint >= 0x20000 && codePoint <= 0x2A6DF) ||
+        (codePoint >= 0x2A700 && codePoint <= 0x2B73F) ||
+        (codePoint >= 0x2B740 && codePoint <= 0x2B81F) ||
+        (codePoint >= 0x2B820 && codePoint <= 0x2CEAF) ||
+        (codePoint >= 0x2CEB0 && codePoint <= 0x2EBEF)
+      ) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  function countEnglishWords(text: string): number {
+    return text.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g)?.length || 0;
+  }
+
+  function isLongPrompt(text: string): boolean {
+    return countChineseCharacters(text) > 200 || countEnglishWords(text) > 200;
+  }
+
+  function pushPromptCandidate(result: string[], value: unknown) {
+    if (typeof value !== 'string') return;
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    result.push(trimmed);
+  }
+
+  function extractStructuredPromptText(value: any): string {
+    if (!value || typeof value !== 'object' || !Array.isArray(value.parts)) return '';
+    return value.parts
+      .map((part: any) => typeof part?.text === 'string' ? part.text.trim() : '')
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+  }
+
+  function collectPromptCandidatesFromPayload(value: any, result: string[] = []): string[] {
+    if (!value || typeof value !== 'object') return result;
+    pushPromptCandidate(result, value.prompt);
+    pushPromptCandidate(result, value.text);
+    const structuredPromptText = extractStructuredPromptText(value.structuredPrompt);
+    if (structuredPromptText) result.push(structuredPromptText);
+
+    const textInput = value.textInput;
+    if (textInput && typeof textInput === 'object') {
+      pushPromptCandidate(result, textInput.prompt);
+      const textInputStructuredPromptText = extractStructuredPromptText(textInput.structuredPrompt);
+      if (textInputStructuredPromptText) result.push(textInputStructuredPromptText);
+    }
+
+    if (Array.isArray(value.requests)) {
+      for (const item of value.requests) {
+        collectPromptCandidatesFromPayload(item, result);
+      }
+    }
+    return result;
+  }
+
+  function extractPromptFromBody(bodyText: string): string {
+    if (!bodyText) return '';
+    try {
+      const payload = JSON.parse(bodyText);
+      const candidates = collectPromptCandidatesFromPayload(payload, []);
+      candidates.sort((a, b) => b.length - a.length);
+      return candidates[0] || '';
+    } catch {
+      return '';
+    }
+  }
+
+  function collectBrowserFingerprint(): Record<string, string> {
+    const fingerprint: Record<string, string> = {
+      user_agent: navigator.userAgent,
+      accept_language: navigator.language || 'en-US',
+    };
+    try {
+      const uaData = (navigator as any).userAgentData;
+      if (uaData) {
+        if (Array.isArray(uaData.brands)) {
+          fingerprint.sec_ch_ua = uaData.brands
+            .map((brand: any) => `"${brand.brand}";v="${brand.version}"`)
+            .join(', ');
+        }
+        fingerprint.sec_ch_ua_mobile = uaData.mobile ? '?1' : '?0';
+        fingerprint.sec_ch_ua_platform = `"${uaData.platform || 'Unknown'}"`;
+      }
+    } catch {}
+    return fingerprint;
+  }
+
+  async function pushCaptchaTokenToServer(
+    token: string,
+    action: 'IMAGE_GENERATION' | 'VIDEO_GENERATION',
+    source: 'intercept' | 'proactive',
+    longPrompt = false
+  ) {
+    if (!captchaCachePushURL || !captchaCacheAuthToken) {
+      postInjectedDebug('打码推送跳过：缺少 pushURL 或 authToken', {});
+      return;
+    }
+    try {
+      const resp = await originalFetch(captchaCachePushURL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${captchaCacheAuthToken}`,
+        },
+        body: JSON.stringify({
+          token,
+          action,
+          long_prompt: longPrompt,
+          fingerprint: collectBrowserFingerprint(),
+          source,
+          page_url: location.href,
+        }),
+      });
+      const result = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      postInjectedDebug('打码 token 已推送', {
+        action,
+        longPrompt,
+        source,
+        poolSize: result.pool_size ?? '?',
+        tokenPrefix: `${token.slice(0, 20)}...`,
+      });
+      window.postMessage({
+        type: 'OPENLINK_CAPTCHA_TOKEN_PUSHED',
+        data: {
+          action,
+          long_prompt: longPrompt,
+          source,
+          pool_size: result.pool_size ?? 0,
+        },
+      }, '*');
+    } catch (error) {
+      postInjectedDebug('打码 token 推送失败', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async function extractFetchBodyText(args: any[]): Promise<string> {
+    const input = args[0];
+    const init = args[1] || {};
+    if (typeof init.body === 'string') return init.body;
+    if (input instanceof Request) {
+      try {
+        return await input.clone().text();
+      } catch {}
+    }
+    return '';
+  }
+
+  function buildCaptchaBlockedBody(): string {
+    return JSON.stringify({
+      _openlink_blocked: true,
+      message: 'reCAPTCHA token cached by OpenLink. Generation blocked.',
+    });
   }
 
   function postInjectedDebug(message: string, meta?: any) {
@@ -864,8 +1072,51 @@ function tryParseToolJSON(raw: string): any | null {
             },
           }, '*');
         });
+    } else if (event.data?.type === 'OPENLINK_SET_CAPTCHA_CACHE') {
+      captchaCacheEnabled = !!event.data?.data?.enabled;
+      captchaCachePushURL = String(event.data?.data?.pushURL || '');
+      captchaCacheAuthToken = String(event.data?.data?.authToken || '');
+      postInjectedDebug('打码缓存模式变更', {
+        enabled: captchaCacheEnabled,
+        hasPushURL: !!captchaCachePushURL,
+      });
+    } else if (event.data?.type === 'OPENLINK_CAPTCHA_GENERATE') {
+      const action = normalizeCaptchaAction(String(event.data?.data?.action || 'IMAGE_GENERATION'));
+      const requestId = String(event.data?.data?.requestId || '');
+      const prompt = String(event.data?.data?.prompt || '');
+      const longPrompt = !!prompt.trim() && isLongPrompt(prompt);
+      void executeFlowRecaptcha(action)
+        .then((token) => {
+          const tokenStr = String(token || '');
+          if (tokenStr && captchaCacheEnabled) {
+            void pushCaptchaTokenToServer(tokenStr, action, 'proactive', longPrompt);
+          }
+          window.postMessage({
+            type: 'OPENLINK_CAPTCHA_GENERATE_RESULT',
+            data: {
+              requestId,
+              success: !!tokenStr,
+              action,
+              long_prompt: longPrompt,
+              tokenPrefix: tokenStr ? `${tokenStr.slice(0, 20)}...` : '',
+            },
+          }, '*');
+        })
+        .catch((error) => {
+          window.postMessage({
+            type: 'OPENLINK_CAPTCHA_GENERATE_RESULT',
+            data: {
+              requestId,
+              success: false,
+              action,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          }, '*');
+        });
     }
   });
+
+  window.postMessage({ type: 'OPENLINK_INJECTED_READY' }, '*');
 
   window.fetch = function(...args) {
     const decoder = new TextDecoder();
@@ -873,6 +1124,29 @@ function tryParseToolJSON(raw: string): any | null {
       let nextArgs = args;
       nextArgs = await patchFlowGenerateArgs(nextArgs);
       captureFlowRequest(nextArgs);
+      if (captchaCacheEnabled) {
+        const interceptURL = getRequestURL(nextArgs[0]);
+        const action = getCaptchaCacheActionForURL(interceptURL);
+        if (action) {
+          const bodyText = await extractFetchBodyText(nextArgs);
+          const recaptchaToken = extractRecaptchaTokenFromBody(bodyText);
+          const prompt = extractPromptFromBody(bodyText);
+          const longPrompt = !!prompt.trim() && isLongPrompt(prompt);
+          if (recaptchaToken) {
+            postInjectedDebug('打码拦截命中', {
+              url: interceptURL.slice(0, 120),
+              action,
+              longPrompt,
+              tokenPrefix: `${recaptchaToken.slice(0, 20)}...`,
+            });
+            void pushCaptchaTokenToServer(recaptchaToken, action, 'intercept', longPrompt);
+            return new Response(buildCaptchaBlockedBody(), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        }
+      }
       const response = await originalFetch.apply(this, nextArgs);
       const requestURL = getRequestURL(nextArgs[0]);
       if (!response.body) return response;
@@ -941,12 +1215,9 @@ function tryParseToolJSON(raw: string): any | null {
       try {
         const url = this.__openlink_url || '';
         const body = typeof args[0] === 'string' ? args[0] : '';
-        const isImageGenerate = url.includes('/flowMedia:batchGenerateImages');
-        const isVideoGenerate =
-          url.includes('/video:batchAsyncGenerateVideoText') ||
-          url.includes('/video:batchAsyncGenerateVideoReferenceImages') ||
-          url.includes('/video:batchAsyncGenerateVideoStartAndEndImage') ||
-          url.includes('/video:batchAsyncGenerateVideoStartImage');
+        const action = getCaptchaCacheActionForURL(url);
+        const isImageGenerate = action === 'IMAGE_GENERATION';
+        const isVideoGenerate = action === 'VIDEO_GENERATION';
 
         if (isImageGenerate || isVideoGenerate) {
           postInjectedDebug('labsfx xhr 请求命中', {
@@ -983,6 +1254,35 @@ function tryParseToolJSON(raw: string): any | null {
               }
               args[0] = patched.bodyText;
             }
+          }
+        }
+
+        if (captchaCacheEnabled && action) {
+          const recaptchaToken = extractRecaptchaTokenFromBody(body);
+          const prompt = extractPromptFromBody(body);
+          const longPrompt = !!prompt.trim() && isLongPrompt(prompt);
+          if (recaptchaToken) {
+            postInjectedDebug('打码拦截命中 (XHR)', {
+              url: url.slice(0, 120),
+              action,
+              longPrompt,
+              tokenPrefix: `${recaptchaToken.slice(0, 20)}...`,
+            });
+            void pushCaptchaTokenToServer(recaptchaToken, action, 'intercept', longPrompt);
+            const self = this;
+            setTimeout(() => {
+              Object.defineProperty(self, 'readyState', { value: 4, writable: true, configurable: true });
+              Object.defineProperty(self, 'status', { value: 200, writable: true, configurable: true });
+              Object.defineProperty(self, 'responseText', {
+                value: buildCaptchaBlockedBody(),
+                writable: true,
+                configurable: true,
+              });
+              self.dispatchEvent(new Event('readystatechange'));
+              self.dispatchEvent(new Event('load'));
+              self.dispatchEvent(new Event('loadend'));
+            }, 0);
+            return;
           }
         }
       } catch {}

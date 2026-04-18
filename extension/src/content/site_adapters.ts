@@ -197,7 +197,11 @@ export function createSiteAdapters(deps: SiteAdapterDeps): SiteAdapter[] {
     id: 'labsfx',
     matches: () => location.hostname === 'labs.google' && location.pathname.startsWith('/fx'),
     config: {
-      editor: 'div[role="textbox"][data-slate-editor="true"][contenteditable="true"]',
+      editor: [
+        'div[role="textbox"][data-slate-editor="true"][contenteditable="true"]',
+        'div[role="textbox"][contenteditable="true"]',
+        'div[role="textbox"]',
+      ].join(', '),
       sendBtn: 'button',
       stopBtn: null,
       fillMethod: 'execCommand',

@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/afumu/openlink/internal/captcha"
 	"github.com/afumu/openlink/internal/types"
 )
-
 
 func testServer(t *testing.T) *Server {
 	t.Helper()
@@ -25,7 +25,11 @@ func testServer(t *testing.T) *Server {
 		Timeout: 10,
 		Token:   "testtoken",
 	}
-	return New(cfg)
+	s := New(cfg)
+	t.Cleanup(func() {
+		s.captchaPool.Close()
+	})
+	return s
 }
 
 func TestHandleHealth(t *testing.T) {
@@ -193,6 +197,259 @@ func TestHandlePrompt(t *testing.T) {
 			t.Errorf("expected prompt content in response")
 		}
 	})
+}
+
+func TestCaptchaCompatEndpoints(t *testing.T) {
+	s := testServer(t)
+
+	pushBody, _ := json.Marshal(map[string]any{
+		"token":  "test_token_1234567890",
+		"action": "IMAGE_GENERATION",
+		"fingerprint": map[string]string{
+			"user_agent": "test-agent",
+		},
+		"source": "intercept",
+	})
+	pushReq := httptest.NewRequest("POST", "/bridge/captcha-tokens/push", bytes.NewReader(pushBody))
+	pushReq.Header.Set("Content-Type", "application/json")
+	pushReq.Header.Set("Authorization", "Bearer testtoken")
+	pushResp := httptest.NewRecorder()
+	s.router.ServeHTTP(pushResp, pushReq)
+	if pushResp.Code != http.StatusOK {
+		t.Fatalf("expected push 200, got %d: %s", pushResp.Code, pushResp.Body.String())
+	}
+
+	solveBody, _ := json.Marshal(map[string]any{
+		"project_id": "test-project",
+		"action":     "IMAGE_GENERATION",
+	})
+	solveReq := httptest.NewRequest("POST", "/api/v1/solve", bytes.NewReader(solveBody))
+	solveReq.Header.Set("Content-Type", "application/json")
+	solveReq.Header.Set("Authorization", "Bearer testtoken")
+	solveResp := httptest.NewRecorder()
+	s.router.ServeHTTP(solveResp, solveReq)
+	if solveResp.Code != http.StatusOK {
+		t.Fatalf("expected solve 200, got %d: %s", solveResp.Code, solveResp.Body.String())
+	}
+
+	var solveData struct {
+		Token       string            `json:"token"`
+		SessionID   string            `json:"session_id"`
+		Fingerprint map[string]string `json:"fingerprint"`
+	}
+	if err := json.NewDecoder(solveResp.Body).Decode(&solveData); err != nil {
+		t.Fatal(err)
+	}
+	if solveData.Token != "test_token_1234567890" {
+		t.Fatalf("expected cached token, got %q", solveData.Token)
+	}
+	if solveData.SessionID == "" {
+		t.Fatal("expected session_id")
+	}
+	if solveData.Fingerprint["user_agent"] != "test-agent" {
+		t.Fatalf("expected fingerprint to round-trip, got %#v", solveData.Fingerprint)
+	}
+
+	statsReq := httptest.NewRequest("GET", "/bridge/captcha-tokens/stats", nil)
+	statsReq.Header.Set("Authorization", "Bearer testtoken")
+	statsResp := httptest.NewRecorder()
+	s.router.ServeHTTP(statsResp, statsReq)
+	if statsResp.Code != http.StatusOK {
+		t.Fatalf("expected stats 200, got %d: %s", statsResp.Code, statsResp.Body.String())
+	}
+
+	configReq := httptest.NewRequest("POST", "/bridge/captcha-tokens/config", bytes.NewReader([]byte(`{"ttl_seconds":300}`)))
+	configReq.Header.Set("Content-Type", "application/json")
+	configReq.Header.Set("Authorization", "Bearer testtoken")
+	configResp := httptest.NewRecorder()
+	s.router.ServeHTTP(configResp, configReq)
+	if configResp.Code != http.StatusOK {
+		t.Fatalf("expected config 200, got %d: %s", configResp.Code, configResp.Body.String())
+	}
+
+	configGetReq := httptest.NewRequest("GET", "/bridge/captcha-tokens/config", nil)
+	configGetReq.Header.Set("Authorization", "Bearer testtoken")
+	configGetResp := httptest.NewRecorder()
+	s.router.ServeHTTP(configGetResp, configGetReq)
+	if configGetResp.Code != http.StatusOK {
+		t.Fatalf("expected config get 200, got %d: %s", configGetResp.Code, configGetResp.Body.String())
+	}
+
+	var configData struct {
+		TTLSeconds int `json:"ttl_seconds"`
+		MaxSize    int `json:"max_size"`
+	}
+	if err := json.NewDecoder(configGetResp.Body).Decode(&configData); err != nil {
+		t.Fatal(err)
+	}
+	if configData.TTLSeconds != 300 {
+		t.Fatalf("expected ttl_seconds 300, got %d", configData.TTLSeconds)
+	}
+	if configData.MaxSize != defaultCaptchaPoolMaxSize {
+		t.Fatalf("expected max_size %d, got %d", defaultCaptchaPoolMaxSize, configData.MaxSize)
+	}
+}
+
+func TestCaptchaSolveMatchesPromptLength(t *testing.T) {
+	s := testServer(t)
+
+	for _, payload := range []map[string]any{
+		{
+			"token":       "short_prompt_token",
+			"action":      "IMAGE_GENERATION",
+			"source":      "intercept",
+			"long_prompt": false,
+		},
+		{
+			"token":       "long_prompt_token",
+			"action":      "IMAGE_GENERATION",
+			"source":      "intercept",
+			"long_prompt": true,
+		},
+	} {
+		pushBody, _ := json.Marshal(payload)
+		pushReq := httptest.NewRequest("POST", "/bridge/captcha-tokens/push", bytes.NewReader(pushBody))
+		pushReq.Header.Set("Content-Type", "application/json")
+		pushReq.Header.Set("Authorization", "Bearer testtoken")
+		pushResp := httptest.NewRecorder()
+		s.router.ServeHTTP(pushResp, pushReq)
+		if pushResp.Code != http.StatusOK {
+			t.Fatalf("expected push 200, got %d: %s", pushResp.Code, pushResp.Body.String())
+		}
+	}
+
+	longPrompt := strings.TrimSpace(strings.Repeat("word ", 201))
+	shortPrompt := "short image prompt"
+	for _, tc := range []struct {
+		name          string
+		body          map[string]any
+		expectedToken string
+	}{
+		{
+			name: "prompt detection chooses long token",
+			body: map[string]any{
+				"project_id": "test-project",
+				"action":     "IMAGE_GENERATION",
+				"prompt":     longPrompt,
+			},
+			expectedToken: "long_prompt_token",
+		},
+		{
+			name: "explicit long_prompt false chooses short token",
+			body: map[string]any{
+				"project_id":  "test-project",
+				"action":      "IMAGE_GENERATION",
+				"long_prompt": false,
+				"prompt":      shortPrompt,
+			},
+			expectedToken: "short_prompt_token",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			solveBody, _ := json.Marshal(tc.body)
+			solveReq := httptest.NewRequest("POST", "/api/v1/solve", bytes.NewReader(solveBody))
+			solveReq.Header.Set("Content-Type", "application/json")
+			solveReq.Header.Set("Authorization", "Bearer testtoken")
+			solveResp := httptest.NewRecorder()
+			s.router.ServeHTTP(solveResp, solveReq)
+			if solveResp.Code != http.StatusOK {
+				t.Fatalf("expected solve 200, got %d: %s", solveResp.Code, solveResp.Body.String())
+			}
+
+			var solveData struct {
+				Token string `json:"token"`
+			}
+			if err := json.NewDecoder(solveResp.Body).Decode(&solveData); err != nil {
+				t.Fatal(err)
+			}
+			if solveData.Token != tc.expectedToken {
+				t.Fatalf("expected token %q, got %q", tc.expectedToken, solveData.Token)
+			}
+		})
+	}
+}
+
+func TestCaptchaPoolPersistsAcrossServerRestart(t *testing.T) {
+	rootDir := t.TempDir()
+	cfg := &types.Config{
+		RootDir: rootDir,
+		Port:    8080,
+		Timeout: 10,
+		Token:   "testtoken",
+	}
+
+	first := New(cfg)
+	pushBody, _ := json.Marshal(map[string]any{
+		"token":  "persisted_token_after_restart",
+		"action": "IMAGE_GENERATION",
+		"source": "intercept",
+	})
+	pushReq := httptest.NewRequest("POST", "/bridge/captcha-tokens/push", bytes.NewReader(pushBody))
+	pushReq.Header.Set("Content-Type", "application/json")
+	pushReq.Header.Set("Authorization", "Bearer testtoken")
+	pushResp := httptest.NewRecorder()
+	first.router.ServeHTTP(pushResp, pushReq)
+	if pushResp.Code != http.StatusOK {
+		t.Fatalf("expected push 200, got %d: %s", pushResp.Code, pushResp.Body.String())
+	}
+	first.captchaPool.Close()
+
+	second := New(cfg)
+	t.Cleanup(func() {
+		second.captchaPool.Close()
+	})
+
+	solveBody, _ := json.Marshal(map[string]any{
+		"project_id": "test-project",
+		"action":     "IMAGE_GENERATION",
+	})
+	solveReq := httptest.NewRequest("POST", "/api/v1/solve", bytes.NewReader(solveBody))
+	solveReq.Header.Set("Content-Type", "application/json")
+	solveReq.Header.Set("Authorization", "Bearer testtoken")
+	solveResp := httptest.NewRecorder()
+	second.router.ServeHTTP(solveResp, solveReq)
+	if solveResp.Code != http.StatusOK {
+		t.Fatalf("expected solve 200 after restart, got %d: %s", solveResp.Code, solveResp.Body.String())
+	}
+
+	var solveData struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(solveResp.Body).Decode(&solveData); err != nil {
+		t.Fatal(err)
+	}
+	if solveData.Token != "persisted_token_after_restart" {
+		t.Fatalf("expected persisted token after restart, got %q", solveData.Token)
+	}
+
+	dbPath := captcha.DefaultDBPath(rootDir)
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("expected captcha db file %q, stat err: %v", dbPath, err)
+	}
+}
+
+func TestServerUpgradesCaptchaPoolMaxSizeOnRestart(t *testing.T) {
+	rootDir := t.TempDir()
+	dbPath := captcha.DefaultDBPath(rootDir)
+
+	firstPool, err := captcha.NewPersistent(dbPath, time.Minute, 50)
+	if err != nil {
+		t.Fatalf("seed persistent pool: %v", err)
+	}
+	firstPool.Close()
+
+	cfg := &types.Config{
+		RootDir: rootDir,
+		Port:    8080,
+		Timeout: 10,
+		Token:   "testtoken",
+	}
+	s := New(cfg)
+	defer s.captchaPool.Close()
+
+	if got := s.captchaPool.Config().MaxSize; got != defaultCaptchaPoolMaxSize {
+		t.Fatalf("expected upgraded max_size %d, got %d", defaultCaptchaPoolMaxSize, got)
+	}
 }
 
 func TestHandleOpenAIModelsIncludesTextAndMedia(t *testing.T) {

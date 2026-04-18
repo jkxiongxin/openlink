@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/afumu/openlink/internal/captcha"
 	"github.com/afumu/openlink/internal/executor"
 	"github.com/afumu/openlink/internal/security"
 	"github.com/afumu/openlink/internal/skill"
@@ -29,11 +30,26 @@ type Server struct {
 	executor       *executor.Executor
 	imageJobBridge *imageJobBridge
 	textJobBridge  *textJobBridge
+	captchaPool    *captcha.Pool
 }
+
+const defaultCaptchaPoolMaxSize = 2000
 
 func New(config *types.Config) *Server {
 	gin.SetMode(gin.ReleaseMode)
-	router := gin.Default()
+	router := gin.New()
+	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{
+		SkipPaths: []string{
+			"/bridge/text-jobs/next",
+		},
+	}))
+	router.Use(gin.Recovery())
+	captchaPool, err := captcha.NewPersistent(captcha.DefaultDBPath(config.RootDir), 30*time.Minute, defaultCaptchaPoolMaxSize)
+	if err != nil {
+		log.Printf("[OpenLink] captcha pool persistent store unavailable, fallback to memory: %v", err)
+		captchaPool = captcha.New(30*time.Minute, defaultCaptchaPoolMaxSize)
+	}
+	captchaPool.SetMaxSize(defaultCaptchaPoolMaxSize)
 
 	s := &Server{
 		config:         config,
@@ -41,6 +57,7 @@ func New(config *types.Config) *Server {
 		executor:       executor.New(config),
 		imageJobBridge: newImageJobBridge(config.RootDir, config.Token),
 		textJobBridge:  newTextJobBridge(),
+		captchaPool:    captchaPool,
 	}
 
 	s.setupRoutes()
@@ -80,6 +97,14 @@ func (s *Server) setupRoutes() {
 	s.router.POST("/v1/images/generations", s.handleOpenAIImageGeneration)
 	s.router.POST("/v1/images/edits", s.handleOpenAIImageEdit)
 	s.router.GET("/generated/*path", s.handleGeneratedAsset)
+	s.router.POST("/api/v1/solve", s.handleCaptchaSolve)
+	s.router.GET("/api/v1/health", s.handleCaptchaHealth)
+	s.router.POST("/api/v1/sessions/:session_id/finish", s.handleCaptchaSessionFinish)
+	s.router.POST("/api/v1/sessions/:session_id/error", s.handleCaptchaSessionError)
+	s.router.POST("/bridge/captcha-tokens/push", s.handleCaptchaTokenPush)
+	s.router.GET("/bridge/captcha-tokens/stats", s.handleCaptchaTokenStats)
+	s.router.GET("/bridge/captcha-tokens/config", s.handleCaptchaTokenConfigGet)
+	s.router.POST("/bridge/captcha-tokens/config", s.handleCaptchaTokenConfigSet)
 }
 
 func (s *Server) handleHealth(c *gin.Context) {

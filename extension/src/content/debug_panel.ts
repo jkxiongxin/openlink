@@ -11,6 +11,7 @@ interface DebugPanelDeps {
   getVisibleTextareas: () => HTMLTextAreaElement[];
   getEditorRegion: (editor: Element | null) => Element | null;
   getLabsFxDebugState: () => { projectId: string; apiHeaderKeys: string[] };
+  getAutoCaptchaFarmerStats: () => unknown;
   registerBrowserTextWorker: (trigger: string) => Promise<Record<string, unknown>>;
   markBrowserTextResponseEnded: (trigger: string) => void;
   showToast: (message: string, durationMs?: number) => void;
@@ -76,6 +77,7 @@ export function createDebugPanelController(deps: DebugPanelDeps) {
       .filter((el) => (el.textContent || '').includes('<tool'))
       .slice(-3);
     const labsFxDebug = deps.getLabsFxDebugState();
+    const autoCaptchaFarmerStats = deps.getAutoCaptchaFarmerStats();
     return {
       capturedAt: new Date().toISOString(),
       location: { href: location.href, hostname: location.hostname, pathname: location.pathname },
@@ -94,6 +96,7 @@ export function createDebugPanelController(deps: DebugPanelDeps) {
       latestToolContainers: toolNodes.map((el) => elementSnapshot(el)),
       labsFxProjectId: labsFxDebug.projectId,
       labsFxAPIHeaderKeys: labsFxDebug.apiHeaderKeys,
+      autoCaptchaFarmerStats,
       debugLogs: getDebugLogs(),
     };
   }
